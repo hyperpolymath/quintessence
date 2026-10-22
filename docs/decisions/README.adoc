@@ -1,3 +1,38 @@
 // SPDX-License-Identifier: CC-BY-SA-4.0
-// Copyright (c) Jonathan D.A. Jewell <j.d.a.jewell@open.ac.uk>
-= decisions Unit
+// Copyright (c) 2026 Jonathan D.A. Jewell <j.d.a.jewell@open.ac.uk>
+= Architecture decision records
+
+An ADR records one decision, the context that forced it, and what it costs. The
+number is permanent: a reversed decision is superseded, not renumbered. Number
+upwards from the highest file in this directory.
+
+Start from link:0000-template.adoc[0000-template.adoc]. Copy it to the next free
+number, fill the status (`Proposed`, then `Accepted` or `Rejected`), and link the
+documents it changes. An ADR that claims a proof result must name the checker and
+the pinned revision, for the same reason the architecture document does: a
+decision resting on a library is only as strong as that library's proof status.
+
+[cols="1,4,2",options="header"]
+|===
+| ADR | Decision | Status
+
+| link:0001-adopt-rsr-standard.adoc[0001]
+| Adopt the Rhodium Standard Repository template and its machine-readable
+  metadata.
+| Accepted (superseded in part)
+
+| link:0002-variant-contract.adoc[0002]
+| Variant templates declare a machine-readable contract with their parent.
+| Accepted (superseded in part)
+
+| link:0003-forge-and-sustain-lifecycle.adoc[0003]
+| One lifecycle: Forge (mint, provision, configure, harness) and Sustain
+  (corrective, adaptive, perfective, preventive).
+| Accepted
+
+| link:0004-three-layer-architecture.adoc[0004]
+| Three layers, one Core Spec IR, one Warrant/Receipt evidence ladder; the
+  boundary is enforced at compile time.
+| Accepted
+
+|===

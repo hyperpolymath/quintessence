@@ -1,0 +1,595 @@
+// SPDX-License-Identifier: CC-BY-SA-4.0
+// Copyright (c) 2026 Jonathan D.A. Jewell <j.d.a.jewell@open.ac.uk>
+= Quintessence Layer C: The Verified Elixir-Idris2-Zig Boundary
+:toc:
+:toc-placement: preamble
+:toc-title: Contents
+:doctype: article
+:revdate: 2026-10-22
+:revnumber: 0.1.0-draft
+
+This is the detailed design of Layer C: the QTT ABI, the ZigProve receipt, the
+`MaxPlus` worst-case bound, and the scheduler decision. It assumes
+link:QUINTESSENCE.adoc[the main specification].
+
+[IMPORTANT]
+====
+Reference design. `ZigProve` and `MPR` are estate contracts; this checkout has no
+pinned public revision for either. The receipt schema and the coverage check are
+quintessence's; the obligation *proofs* are the tools'. A missing or mismatched
+obligation is a hard failure, not a warning.
+====
+
+== Boundary shapes
+
+Two shapes are supported:
+
+[cols="1,3,3",options="header"]
+|===
+| Shape | Architecture | Trade-off
+
+| A (MVP)
+| Elixir stub -> Rustler (Rust) -> Zig static library (`zig build-lib -static`)
+| Rustler owns terms and `ResourceArc`; Zig owns the algorithm and its memory.
+  One extra C ABI (Rust `extern "C"` to Zig). Recommended: the Rust glue is small
+  and the Rustler lifetime discipline is already checked.
+
+| B (Phase 4)
+| Elixir stub -> pure Zig NIF using `erl_nif.h`
+| Zero-copy and fewer layers, but the Zig code owns `ErlNifEnv`, `ERL_NIF_TERM`
+  lifetimes, dirty flags, and term encoding. The obligation set is larger; only
+  for a proven team and a measured need.
+|===
+
+The rest of this document describes shape A. Shape B reuses the receipt schema
+but adds term-lifetime obligations (C9) that Rustler currently discharges.
+
+== The Idris2 QTT ABI
+
+The ABI module is the contract. It is total, linear in the resource, and explicit
+about every `%foreign` call.
+
+[source,idris2]
+----
+module Verisim.Abi
+
+import Data.Bits
+import Data.So
+import Data.Vect
+
+%default total
+
+public export
+data HandleState = Open | Closed
+
+||| A native handle. The pointer proof is erased (0) and checked at
+||| construction; a closed handle cannot be used because the state index
+||| changes.
+public export
+data Handle : HandleState -> Type where
+  MkHandle : (ptr : Bits64) -> (0 nonNull : So (ptr /= 0)) -> Handle Open
+
+||| A borrowed byte buffer. The length is bounded by the verified maximum;
+||| the pointer is non-null for a non-empty buffer.
+public export
+data Buffer = MkBuffer
+  (ptr : Bits64)
+  (len : Bits32)
+  (0 bounded : So (len <= 1048576))
+
+||| A linear resource. Exactly one owner at a time; the wrapper returns it.
+public export
+data Resource : Type where
+  MkResource : Handle Open -> Resource
+
+public export
+data Digest = MkDigest Bits64   -- 32 bytes on the wire; full module uses Vect 32 Bits8
+
+public export
+data Drift = MkDrift (Fin 10001) -- basis points, 0 .. 10000
+
+%foreign "C:verisim_hash,libverisim_nif"
+prim__hash : Bits64 -> Bits64 -> Bits32 -> Bits32 -> PrimIO Bits64
+
+%foreign "C:verisim_drift,libverisim_nif"
+prim__drift : Bits64 -> Bits64 -> Bits64 -> PrimIO Bits32
+
+public export
+hash : (1 r : Resource) -> (payload : Buffer) -> (seed : Bits32)
+    -> IO (Either String (Digest, Resource))
+hash (MkResource (MkHandle ptr nonNull)) (MkBuffer p len _) seed = do
+  out <- primIO (prim__hash ptr p len seed)
+  if out == 0
+    then pure (Left "hash failed")
+    else pure (Right (MkDigest out, MkResource (MkHandle ptr nonNull)))
+
+public export
+drift : (1 r : Resource) -> (a : Digest) -> (b : Digest)
+     -> IO (Either String (Drift, Resource))
+drift r (MkDigest x) (MkDigest y) = do
+  out <- primIO (prim__drift (ptrOf r) x y)
+  case decLT out 10001 of
+    Yes prf => pure (Right (MkDrift (MkFin out prf), r))
+    No _    => pure (Left "drift out of range")
+----
+
+`ptrOf` is an abstract accessor in the full module. The `1` multiplicity on the
+resource means the function consumes it exactly once and returns it; the caller
+cannot duplicate or drop it. The `0` on the bounds and non-null proofs means they
+are erased at runtime. The `Either String` return models every native error as
+data; no exception crosses the ABI.
+
+=== The linearity gap
+
+`ResourceArc` is reference-counted and shared. Two Elixir processes can hold the
+same `ResourceArc`; the BEAM does not enforce the Idris2 `1`. Rustler prevents
+use-after-free because the refcount keeps the resource alive, but it does not
+prevent two owners. Quintessence closes the gap at the stub:
+
+* the stub stores an ownership token `{owner_pid, ref, generation}` in the
+  resource;
+* every NIF call checks `self() == owner_pid`, `ref` is live, and `generation`
+  matches;
+* a transfer requires an explicit `transfer/2` that changes the owner under a
+  lock and increments the generation;
+* a call from a non-owner returns `{:error, :not_owner}`.
+
+This is *stub-enforced linearity*, not kernel-proved linearity. The receipt says
+so: `linearity: stub-enforced`. The Idris2 type is the specification of the
+intended discipline; the runtime token is the enforcement.
+
+== Rustler glue rules
+
+The Rust glue is deliberately small. Its job is to translate terms to owned data,
+call the Zig core, and translate the result back.
+
+[source,rust]
+----
+use rustler::{Encoder, Env, ResourceArc, Term};
+use std::sync::Mutex;
+
+pub struct Core {
+    inner: Mutex<verisim_core::Core>,
+}
+
+#[rustler::resource_impl]
+impl rustler::Resource for Core {}
+
+#[rustler::nif(schedule = "Normal")]
+fn hash<'a>(
+    env: Env<'a>,
+    core: ResourceArc<Core>,
+    payload: rustler::Binary<'a>,
+    seed: u32,
+) -> NifResult<Term<'a>> {
+    let bytes = payload.as_slice();
+    if bytes.len() > 1_048_576 {
+        return Ok((rustler::atoms::error(), rustler::atoms::too_large()).encode(env));
+    }
+
+    let guard = core.inner.lock().map_err(|_| rustler::Error::Term(Box::new("poisoned")))?;
+    let mut out = [0u8; 32];
+    let rc = verisim_core::hash(guard.handle(), bytes.as_ptr(), bytes.len() as u32, seed, &mut out);
+    if rc != 0 {
+        return Ok((rustler::atoms::error(), rc).encode(env));
+    }
+    Ok((rustler::atoms::ok(), rustler::Binary::from(&out[..])).encode(env))
+}
+
+rustler::init!("Elixir.Verisim.Nif");
+----
+
+Rules:
+
+. *No `Term` in a resource.* `Term<'a>` is tied to `Env<'a>` and must not
+   outlive the call. Decode to owned `Vec<u8>`, `String`, or a fixed array before
+   crossing into Zig; encode after.
+. *No raw pointer in the resource.* The resource owns a `Core` with a handle to
+   Zig-owned memory; the handle is not an `ErlNifEnv` pointer.
+. *No panic across the ABI.* Wrap the Zig call in `catch_unwind` if the Zig code
+   can panic; the MVP's Zig core returns error codes instead.
+. *One lock per resource.* Dirty NIFs may run concurrently; a `Mutex` protects
+   the Zig core, or the core is stateless. The hash/drift core is stateless except
+   for the handle, so the lock is cheap and the proof is easier.
+. *Schedule matches the receipt.* `#[nif(schedule = "Normal")]` or
+   `"DirtyCpu"` is compiled into the `.so`; the receipt records it; `mix verify`
+   checks the generated `nif_manifest.json` against the receipt. A mismatch is
+   `Q-305`.
+. *No `@cImport` of an unaudited header.* The Zig core imports only `std` and a
+   local `core.h` generated from the Idris2 ABI. Any other C dependency is a new
+   obligation set.
+
+== The Zig core
+
+[source,zig]
+----
+const std = @import("std");
+
+pub const Error = enum(u32) {
+    ok = 0,
+    invalid = 1,
+    too_large = 2,
+    overflow = 3,
+};
+
+/// Hash a byte slice into a 32-byte digest.
+/// Preconditions: `payload` is non-null and `len <= 1 MiB`; `out` is non-null
+/// and 32-byte aligned. The function allocates nothing and touches no globals.
+export fn verisim_hash(
+    handle: ?*anyopaque,
+    payload: ?[*]const u8,
+    len: u32,
+    seed: u32,
+    out: ?*[32]u8,
+) callconv(.c) u32 {
+    _ = handle orelse return @intFromEnum(Error.invalid);
+    const p = payload orelse return @intFromEnum(Error.invalid);
+    const o = out orelse return @intFromEnum(Error.invalid);
+    if (len > 1_048_576) return @intFromEnum(Error.too_large);
+
+    const slice = p[0..len];
+    var hasher = std.crypto.hash.blake3.Blake3.init(.{});
+    hasher.update(slice);
+    hasher.final(o);
+    _ = seed;
+    return @intFromEnum(Error.ok);
+}
+
+/// Drift in basis points: popcount of the XOR of two 32-byte digests, scaled to
+/// 0 .. 10000. No allocation, no globals, no overflow (max 256 * 10000 / 256).
+export fn verisim_drift(
+    a: ?*const [32]u8,
+    b: ?*const [32]u8,
+    out: ?*u32,
+) callconv(.c) u32 {
+    const x = a orelse return @intFromEnum(Error.invalid);
+    const y = b orelse return @intFromEnum(Error.invalid);
+    const o = out orelse return @intFromEnum(Error.invalid);
+
+    var bits: u32 = 0;
+    for (x, y) |xb, yb| {
+        bits += @as(u32, @popCount(xb ^ yb));
+    }
+    o.* = (bits * 10_000) / 256;
+    return @intFromEnum(Error.ok);
+}
+----
+
+The core is allocation-free, global-free, and has no `@cImport`. That makes the
+ZigProve obligation set small and the `MaxPlus` bound a constant. A core that
+allocates, uses a global allocator, or calls into C is not forbidden, but it
+needs a larger receipt and a larger bound; it is a separate work package.
+
+== The ZigProve receipt
+
+The receipt is the native layer's Warrant. It is generated at build time, signed,
+and checked at load time.
+
+[source,json]
+----
+{
+  "schema": "quintessence.nif.receipt/v1",
+  "subject": {
+    "name": "verisim_nif",
+    "abi_module": "Verisim.Abi",
+    "abi_sha256": "7d1e...",
+    "source_sha256": "b1e4...",
+    "binary_sha256": "9f2c...",
+    "target": "x86_64-unknown-linux-gnu",
+    "zig_version": "0.15.2",
+    "rustler_version": "0.36.1",
+    "optimize": "ReleaseSafe"
+  },
+  "obligations": [
+    {"id": "C1.no-null-deref",      "status": "proved", "checker": "zigprove", "proof_sha256": "aa01..."},
+    {"id": "C2.in-bounds",          "status": "proved", "checker": "zigprove", "proof_sha256": "aa02..."},
+    {"id": "C3.alignment",          "status": "proved", "checker": "zigprove", "proof_sha256": "aa03..."},
+    {"id": "C4.initialized",        "status": "proved", "checker": "zigprove", "proof_sha256": "aa04..."},
+    {"id": "C5.no-alias",           "status": "proved", "checker": "zigprove", "proof_sha256": "aa05..."},
+    {"id": "C6.no-overflow",        "status": "proved", "checker": "zigprove", "proof_sha256": "aa06..."},
+    {"id": "C7.alloc-free",         "status": "proved", "checker": "zigprove", "proof_sha256": "aa07..."},
+    {"id": "C8.no-unwind",          "status": "proved", "checker": "zigprove", "proof_sha256": "aa08..."},
+    {"id": "C9.no-term-escape",     "status": "proved", "checker": "rustler",  "proof_sha256": "aa09..."},
+    {"id": "C10.thread-safe",       "status": "proved", "checker": "zigprove", "proof_sha256": "aa10..."},
+    {"id": "C11.destructor-once",   "status": "proved", "checker": "rustler",  "proof_sha256": "aa11..."},
+    {"id": "C12.allocator-match",   "status": "proved", "checker": "zigprove", "proof_sha256": "aa12..."}
+  ],
+  "budget": {
+    "model": "maxplus/v1",
+    "expr": "max(180, 240)",
+    "bound_us": 240,
+    "threshold_us": 1000,
+    "margin_us": 100,
+    "schedule": "normal",
+    "maxplus_proof_sha256": "bc01..."
+  },
+  "warrant": {
+    "id": "w-2026-10-22-0001",
+    "trust_level": 4,
+    "status": "complete",
+    "route": ["zigprove", "lean4"]
+  }
+}
+----
+
+The `budget` block has two checks:
+
+* *Arithmetic*: the `expr` is evaluated in the `MaxPlus` algebra; `bound_us` is
+  the result; `bound_us <= threshold_us` for `normal`, or `bound_us >
+  threshold_us` for `dirty_cpu`.
+* *Proof*: `maxplus_proof_sha256` is a Lean proof term that imports
+  `tropical-types` and checks the arithmetic and the comparison. The receipt
+  carries the hash; the checker re-runs Lean or verifies the proof.
+
+The `warrant.trust_level` is ECHIDNA's. A native receipt at Level 4 is a local
+warrant; Level 5 requires the batch Coq/Lean check of the ABI and the `MaxPlus`
+proof. The NIF gate requires Level 5.
+
+== Heap-corruption obligations
+
+[cols="1,2,4",options="header"]
+|===
+| ID | Obligation | How it is discharged
+
+| C1 | No null/dangling dereference.
+| Non-null types (`So (ptr /= 0)`, `?*T` with `orelse`), ZigProve provenance.
+| C2 | Every slice access in bounds.
+| `p[0..len]` with `len <= 1 MiB`; ZigProve bounds proof; no unchecked pointer
+  arithmetic.
+| C3 | Every load/store aligned.
+| Idris2 layout proof + Zig `@alignOf`; `*[32]u8` is 1-aligned, `u32*` is
+  4-aligned.
+| C4 | No uninitialized read.
+| Zig definite assignment; `out` is written before return on every path.
+| C5 | No aliasing violation.
+| `payload` and `out` are distinct; Rustler passes separate allocations; ZigProve
+  borrow discipline.
+| C6 | No unchecked overflow.
+| `bits <= 256`, `bits * 10000 <= 2_560_000` fits `u32`; Zig `ReleaseSafe`
+  keeps overflow checks.
+| C7 | Allocation/free pairing.
+| Core allocates nothing; `alloc-free` is vacuous. A future allocating core needs
+  an allocator-threading proof.
+| C8 | No unwind across the ABI.
+| Zig returns error codes; Rust glue does not panic; `catch_unwind` at the
+  Rustler boundary.
+| C9 | No `Term`/`Env` escape.
+| Rustler types: `ResourceArc<Core>` is `'static`; no `Term<'a>` in `Core`.
+| C10 | Thread safety.
+| Core is stateless or behind a `Mutex`; no globals; dirty NIFs are safe.
+| C11 | `ResourceArc` destructor exactly once.
+| Rustler refcount; `Drop` calls the Zig `deinit` once.
+| C12 | Allocator match.
+| No allocation; a future allocator must be threaded through every call.
+|===
+
+Coverage is checked by ID, not by count. A receipt with twelve obligations but
+one `status: assumed` fails. A receipt with a renamed obligation fails until the
+adapter maps it; the semantic coverage list is the contract.
+
+== The MaxPlus cost calculus
+
+The cost algebra is `tropical-types`' `Tropical`:
+
+[source,text]
+----
+Carrier:   Tropical = bot | val Nat
+add:       max          (choice / branch)
+mul:       +            (sequence)
+zero:      bot          (identity of max; "no alternative")
+one:       val 0        (identity of +; "free")
+order:     bot <= val n  and  val n <= val m  iff n <= m
+----
+
+`bot` is not zero cost. It is the "no path" element: a dead branch. Zero cost is
+`val 0`. A checker that uses `bot` for zero will under-count a live path; the
+type system prevents that because `bot` is the additive identity, not the
+multiplicative one.
+
+=== Cost syntax
+
+[source,ebnf]
+----
+cost ::= "0" | nat | cost "+" cost | "max" "(" cost "," cost ")"
+       | nat "*" cost | "cost" "(" expr ")" | "Unknown"
+----
+
+The `cost(e)` form is an annotation supplied by ZigProve for a native call; it is
+not inferred by quintessence. `Unknown` is outside the semiring and rejects.
+
+=== Typing rules
+
+[source,text]
+----
+Gamma |- e : T ! c
+-------------------------------- T-Seq
+Gamma |- e1; e2 : T2 ! c1 + c2
+
+Gamma |- e1 : T ! c1    Gamma |- e2 : T ! c2
+-------------------------------- T-If
+Gamma |- if b then e1 else e2 : T ! max(c1, c2)
+
+Gamma |- body : T ! c    n is a literal or a proved bound
+-------------------------------- T-Loop
+Gamma |- for i in 1..n { body } : unit ! n * c
+
+Gamma |- body : T ! c    n is not bounded
+-------------------------------- T-Unbounded
+Gamma |- while b { body } : unit ! Unknown
+
+f : (x:T) -> U ! c_f    Gamma |- a : T ! c_a
+-------------------------------- T-Call
+Gamma |- f(a) : U ! c_f + c_a
+
+nif f : ... ! c_f    c_f from receipt
+-------------------------------- T-Nif
+Gamma |- f(a) : U ! c_f + c_a
+----
+
+The `T-Loop` rule is where most NIF bounds fail. A loop over a payload's bytes
+has a bound only if the payload length is bounded by the ABI (`len <= 1 MiB`);
+then `n` is `1_048_576` and `c` is the per-byte cost. A loop over a hash's rounds
+has a literal bound. A loop over a caller-supplied count without a bound is
+`Unknown` and is rejected or forced to `.dirty_cpu` with a runtime cap.
+
+=== The bound check
+
+[source,text]
+----
+bound = eval(cost)
+if bound = Unknown            -> Q-302 (cannot bound)
+if bound > budget_us          -> Q-302 (over budget)
+if bound <= threshold_us      -> schedule = normal
+if bound >  threshold_us      -> schedule = dirty_cpu
+if bound > threshold_us - margin_us and bound <= threshold_us
+                              -> schedule = dirty_cpu (safety margin)
+----
+
+The margin is a deliberate pessimism: a bound of 980 us with a 100 us margin is
+treated as dirty, because a WCET is a model, not a measurement. The margin is
+recorded in the receipt; a reviewer can see why the schedule was chosen.
+
+=== The scheduler argument
+
+[source,text]
+----
+Assumptions:
+  - a normal scheduler thread runs one process at a time;
+  - a normal NIF occupies the thread for at most T = threshold_us;
+  - there are R normal schedulers and P runnable processes;
+  - no other long-running NIF or GC pause is on the thread.
+
+Claim:
+  a runnable process waits at most T + ceil(P / R) * slice before it runs,
+  where slice is the ordinary reduction slice (~1 ms).
+
+Dirty NIFs:
+  they run on D = dirty_cpu_schedulers threads; if at most K <= D run
+  concurrently, the queue wait is at most ceil(Q / D) * c_max for Q queued
+  dirty jobs. If K > D, the dirty pool is the bottleneck; the spec must bound K
+  with a semaphore or a pool.
+----
+
+This is a scheduling bound, not a proof of the BEAM. The receipt records the
+model (`maxplus/v1`), the threshold, the margin, and the concurrency limit. The
+trust ledger records the assumption.
+
+== Why the schedule is compiled, not chosen at runtime
+
+The dirty flag is part of the `ErlNifFunc` entry in the `.so`; it cannot be
+changed by the Elixir stub. The build therefore decides the schedule, and the
+receipt records it. `mix verify` checks three things:
+
+. The receipt's `schedule` matches the Rustler `#[nif(schedule = ...)]`
+   annotation in the generated `nif_manifest.json`.
+. The `MaxPlus` bound is consistent with the schedule (`normal` requires
+   `<= threshold`, `dirty_cpu` requires `> threshold` or an explicit override).
+. The `budget_us` is <= the declared `@budget`.
+
+A mismatch is `Q-305`. There is no runtime "auto-dirty" switch; a NIF that is
+too slow cannot be rescued by the stub. `schedule: :auto` in `@nif` is therefore
+an assertion, not a choice: it says the stub accepts whatever schedule the build
+compiled, provided the receipt agrees with it.
+
+== Load-time verification
+
+`use Quintessence.Nif` generates:
+
+[source,elixir]
+----
+@on_load :__quintessence_load__
+
+def __quintessence_load__ do
+  with {:ok, receipt} <- Quintessence.Receipt.read(@receipt),
+       :ok <- Quintessence.Receipt.validate_schema(receipt),
+       :ok <- Quintessence.Receipt.check_target(receipt),
+       :ok <- Quintessence.Receipt.check_binary(receipt, @library_path),
+       :ok <- Quintessence.Receipt.check_obligations(receipt),
+       :ok <- Quintessence.Receipt.check_schedule(receipt, @schedule),
+       :ok <- :erlang.load_nif(@library_path, 0) do
+    :ok
+  else
+    {:error, reason} -> {:error, reason}
+  end
+end
+----
+
+Failure modes:
+
+[cols="1,2,2",options="header"]
+|===
+| Code | Cause | Behaviour
+
+| `Q-301` | Receipt missing or unreadable | Module does not load.
+| `Q-302` | `MaxPlus` bound exceeds budget or is `Unknown` | Module does not load.
+| `Q-303` | Binary SHA-256 mismatch | Module does not load.
+| `Q-304` | An obligation is not `proved` | Module does not load.
+| `Q-305` | Schedule mismatch | Module does not load.
+| `Q-306` | Target triple mismatch | Module does not load.
+| `Q-307` | ABI module hash mismatch | Module does not load.
+|===
+
+The load check is not a proof; it is a supply-chain and build-consistency check.
+It prevents a stale or substituted `.so` from being used with a receipt that
+describes a different build.
+
+== Reproducible builds
+
+The receipt's `binary_sha256` is only meaningful if the build is reproducible.
+
+* Zig: `zig build-lib -static -Dtarget=x86_64-linux-gnu -Doptimize=ReleaseSafe`.
+  `ReleaseSafe` keeps bounds and overflow checks; `ReleaseFast` disables them,
+  so a `ReleaseFast` build requires a different receipt and a different
+  obligation set (or is rejected).
+* Rust: `cargo build --release --locked`; `Cargo.lock` committed; Rustler version
+  pinned.
+* Environment: `SOURCE_DATE_EPOCH`, `TZ=UTC`, `LC_ALL=C`, fixed paths via
+  `--remap-path-prefix`.
+* The `.so` is hashed after stripping; the hash is written into the receipt and
+  into the release artifact manifest.
+
+A build that is not reproducible can still be verified, but the receipt is
+labelled `reproducibility: unverified` and the NIF gate requires a manual
+review.
+
+== Validation strategy
+
+. *Zig unit tests* for the core: empty payload, 1 MiB payload, 1 MiB + 1,
+   all-zero digest, all-ones digest, drift 0 and 10000.
+. *Elixir integration tests* through the stub: successful call, error path,
+   stale receipt, tampered binary, wrong schedule.
+. *Differential tests*: a pure Elixir reference implementation of BLAKE3 and
+   drift; random payloads; compare.
+. *Fuzzing*: AFL++ or `zig build test` with a fuzz target; the fuzz corpus is
+   part of the repo.
+. *Sanitizers*: ASan/UBSan for the C ABI; `valgrind` for the Rust glue; `miri`
+   for the Rust code where possible.
+. *Receipt mutation*: ECHIDNA mutates the receipt (drop an obligation, widen the
+   bound, flip the schedule) and checks that the load fails.
+
+Validation does not replace the receipt. It catches integration bugs that the
+proofs do not model, such as a Rustler version change that alters term encoding.
+
+== Open issues
+
+* *ZigProve interface.* The obligation names and proof format are an external
+  contract. The adapter maps them; the coverage check is quintessence's. Until a
+  revision is pinned, the receipt is `assumption: zigprove-unpinned`.
+* *MPR interface.* The capability names and `Sigma` representation are an
+  external contract; the adapter is small, but the R5 composition rule is
+  quintessence's.
+* *Floating point.* The MVP avoids it. A NIF returning a float needs a model of
+  IEEE754 and a proof that the BEAM's float is the same; that is Phase 5.
+* *Allocating cores.* The MVP's core is allocation-free. An allocating core needs
+  C7/C12 with an allocator-threading proof and a `MaxPlus` bound that includes
+  allocation cost.
+* *`@cImport`.* Not allowed in the MVP. A future core that imports C headers
+  needs a header-level ABI proof and a new obligation set.
+* *Dirty pool saturation.* The scheduler argument bounds a single NIF, not the
+  aggregate. A pool/semaphore and a queue bound are required for concurrent NIFs.
+* *Cross-compilation.* The receipt is target-specific. A cross-compiled `.so`
+  needs its own receipt and a target check.
+* *Rustler term lifetimes.* Rustler's types prevent most escapes, but a
+  `ResourceArc` can hold a `Term` only if the type system allows it; the MVP's
+  `Core` type forbids it by construction. A future API that returns a term from a
+  resource needs a lifetime audit.

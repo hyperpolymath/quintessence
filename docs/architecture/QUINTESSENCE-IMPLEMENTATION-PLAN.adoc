@@ -1,0 +1,294 @@
+// SPDX-License-Identifier: CC-BY-SA-4.0
+// Copyright (c) 2026 Jonathan D.A. Jewell <j.d.a.jewell@open.ac.uk>
+= Quintessence Implementation Plan and Engineering Execution Blueprint
+:toc:
+:toc-placement: preamble
+:toclevels: 3
+:sectnums:
+:doctype: article
+
+_From architectural specification to an executable, kernel-checked verifier._
+
+== Purpose and current state audit
+
+This document turns the architectural specification in
+link:QUINTESSENCE.adoc[QUINTESSENCE.adoc] into a concrete, file-by-file
+engineering plan and records what is **already implemented and executing today**
+versus what remains scheduled across Phases 2--6 of
+link:../status/QUINTESSENCE-ROADMAP.adoc[QUINTESSENCE-ROADMAP.adoc].
+
+Per estate doctrine (*"Report faithfully — no overclaim"*, *"Ground-truth by
+running the tool, not trusting status docs"*), every claim below distinguishes
+verified reality in this repository from upstream integrations still to be
+wired.
+
+=== Implemented reality today (`v0.1.0-alpha` vertical slice)
+
+The six-week vertical slice described in the roadmap is implemented in native
+Zig (`src/core/*.zig` + `src/interface/ffi/`) with an idiomatic Elixir/Mix
+frontend (`mix.exs`, `lib/quintessence/*.ex`, `lib/mix/tasks/*.ex`), a formal
+Idris2 QTT IR module (`src/interface/Abi/Qir.idr`), a reusable Apalache/TLA+
+module (`verification/proofs/tlaplus/QuintessenceKCut.tla`), and a 15-case live
+verification regression suite (`tests/quintessence/run_suite.sh`).
+
+[cols="2,2,3",options="header"]
+|===
+| Subsystem | Implementation file(s) | Live status today
+
+| Native CLI & C-ABI FFI
+| `src/interface/ffi/src/cli_main.zig`, `src/interface/ffi/src/main.zig`, `src/interface/ffi/build.zig`
+| Compiles cleanly under `zig 0.17.0` (`-Doptimize=ReleaseSafe`) to `zig-out/bin/quintessence` and `zig-out/lib/libquintessence.so`. Subcommands `verify`, `explain`, `receipt`, and `doctor` enforce exact OS exit codes `0..5`.
+
+| Error catalogue & remedies
+| `src/core/errors.zig`
+| 23 stable codes (`Q-101`..`Q-905`) with layer, exit status, formal rule citation, falsifier statement, and actionable remedy.
+
+| RFC 8785 JCS & SHA-256 content addressing
+| `src/core/jcs.zig`
+| Deterministic UTF-8 lexicographic key sorting, minimal RFC 8785 string escaping, and SHA-256 digests (`sha256:<hex>`) across `qir/v1`, Warrants, and Receipts.
+
+| Elixir CST/AST lexer, parser & G0a--G0c firewall
+| `src/core/elixir_ast.zig`, `src/core/firewall.zig`, `lib/quintessence/core_runtime.ex`
+| Recursive-descent parser over sequential Elixir, `Quintessence.Face`, `@choreography`, and `Quintessence.Nif`; enforces `Q-101` (`Code.eval_*`), `Q-102` (dynamic `apply`), `Q-103` (ambient impurity), `Q-105` (raw `:erlang.load_nif`), `Q-108` (concurrency in Layer A), and `Q-206` (MPR R5 capability exfiltration).
+
+| `qir/v1` elaborator & batch kernel emitters
+| `src/core/qir.zig`, `src/interface/Abi/Qir.idr`
+| Emits canonical JCS `qir.v1.json`, Rocq/Coq `quintessence_obligations.v`, and Lean 4 `QuintessenceObligations.lean` linked by `qir_sha256`.
+
+| Dual-solver engine & native Alethe proof kernel
+| `src/core/smt_alethe.zig`
+| Dispatches every obligation to `z3 5.3.1` and `cvc5 1.4.2` (`--produce-proofs --proof-format-mode=alethe`), parses the emitted S-expression Alethe proof tree, checks paren balance, topological premise DAG acyclicity, `anchor`/`subproof` discharge scoping, empty-clause `(cl)` QED derivation, and counts resolution steps and rewrite holes honestly.
+
+| Layer A verifier (VCs, `QF_BV` lemmas, TINI, V1/V2)
+| `src/core/layer_a.zig`
+| Discharges `VC-POST`, recursive `VC-TERM`, hardware bit-vector lemmas (`QF_BV` Kernighan `band(n, n - 1) < n`), 2-safety relational `TINI` non-interference (`Q-206`), V1 antecedent satisfiability (`Q-601`), and V2 postcondition non-triviality (`Q-602`).
+
+| Layer B verifier (`K-CUT` typing + `k = 12` BMC + V4)
+| `src/core/layer_b.zig`
+| Enforces `Y-5` (`receiver-knows-sent`), `Y-6` pre-registered falsifier (`Q-401` with concrete Z3 dropped-message counterexample trace), `Y-8` two-party boundary (`Q-403`), epoch monotonicity (`Q-404`), V4 reachability (`Q-604`), and symbolic `k = 12` BMC over `MailboxBound`, `NoUnwarrantedRemoteClaim`, and `EpochConsistent`, emitting `.tla`.
+
+| Layer C NIF verifier (`MaxPlus` + deterministic `.so` + `dlopen`)
+| `src/core/layer_c.zig`
+| Audits Zig core (`C1`--`C12`), computes tropical `MaxPlus` WCET bounds (`<= 1,000 us` normal vs `:dirty_cpu`, `Q-305`), runs `zig test`, compiles reproducible `-fstrip` `.so`, probes live ABI symbols via POSIX `dlopen`/`dlsym` (`Q-304`), and checks binary SHA-256 against `quintessence.nif.receipt/v1` (`Q-303`).
+
+| Stage 9 ECHIDNA 6-kind mutation engine
+| `src/core/vacuity_mutation.zig`
+| Generates AST/protocol/budget mutants across `BoundaryShift`, `OperatorSwap`, `GuardDrop`, `BranchFlip`, `CastForCall`, and `BudgetInflate`; runs live solver killing and rejects specs scoring `< 95.0%` with `Q-603` (exit `5`).
+|===
+
+=== Honest scope boundaries (Phases 2--6 work remaining)
+
+[cols="2,3,2",options="header"]
+|===
+| Area | Current mechanism in `v0.1.0-alpha` | Full target phase
+
+| Macro expansion & bytecode firewall
+| Static source AST G0a--G0c firewall in `src/core/firewall.zig` plus Elixir `Code.Tracer` module `Quintessence.Tracer` ready for `mix compile`.
+| Phase 1--2: live `beam_lib` chunks + Bubblewrap double-expansion determinism audit inside `mix compile`.
+
+| Sequential VC backend
+| Direct lowering from AST/`qir/v1` into ground quantifier-free `QF_UFLIA` + `QF_BV` SMT-LIB 2.6 solved by Z3 + CVC5 and checked by the native Alethe DAG kernel.
+| Phase 2 & Phase 5: full WhyML generation + standalone `dkcheck` lambda-Pi-modulo Dedukti kernel theory.
+
+| Protocol checking
+| Static `K-CUT` rule check + 12-step unrolled SMT BMC in Z3 + CVC5 (22,507 Alethe steps across 3 invariants) + `.tla` file emission.
+| Phase 3: direct `apalache-mc check --length=12` execution alongside ECHIDNA witness ingestion.
+
+| NIF proof obligations
+| Static AST C1--C12 safety & `MaxPlus` analyzer + live `zig test` + reproducible `-fstrip` `.so` build + `dlopen` ABI smoke vectors.
+| Phase 2 & Phase 4: Zig AIR / `ZigProve` IR extraction and Rustler `ResourceArc<T>` linear ownership audit.
+
+| Batch Level-5 promotion
+| Honest `trust_level: 4` local certification when `coqc` and `lean` are absent; emits `.v` and `.lean` files and returns `Q-504` (exit `4`) under `--require-level-5`.
+| Phase 5: ECHIDNA gRPC batch service running `coqc` + `lean` in isolated containers to sign Level-5 `COMPLETE` Receipts.
+|===
+
+== Architectural design of the native engine
+
+=== Why a native Zig core behind thin language bridges
+
+Quintessence deliberately implements Stages 1--10 inside a zero-dependency
+compiled Zig library and CLI (`src/core/` + `src/interface/ffi/`) wrapped by a
+thin Elixir Mix task layer (`lib/quintessence/`):
+
+. *Estate language policy compliance.* Zig, Elixir, Idris2, Agda, Lean 4, and
+  Coq are first-class authorised languages across the estate; no Python,
+  TypeScript, Go, or Nix code exists anywhere in the repository.
+. *Single source of truth for `qir/v1`, JCS hashing, and exit codes.* Implement-once
+  semantics ensure CLI runs, CI SARIF jobs, C-ABI FFI callers, and `mix verify`
+  produce bit-for-bit identical `qir_sha256`, `warrant_sha256`, and exit codes.
+. *Direct `dlopen` and binary inspection.* Layer C inspects compiled ELF `.so`
+  exports and executes linear null-handle probes in-process via POSIX `dlopen`
+  without starting a separate runtime.
+
+=== End-to-end execution dataflow
+
+[source,text]
+----
+  *.ex sources ──▶ [elixir_ast.zig] ──▶ ModuleAst[] (with file:line:col spans)
+                                             │
+                                             ▼
+                                      [firewall.zig]  ──▶ Q-101..Q-108, Q-206
+                                             │
+                                             ▼
+                                        [qir.zig]     ──▶ qir.v1.json (RFC 8785 JCS)
+                                             │            quintessence_obligations.v
+                                             │            QuintessenceObligations.lean
+                 ┌───────────────────────────┼───────────────────────────┐
+                 ▼                           ▼                           ▼
+          [layer_a.zig]               [layer_b.zig]               [layer_c.zig]
+      QF_UFLIA + QF_BV VCs       K-CUT Y-5/Y-6/Y-8 check     C1-C12 + MaxPlus WCET
+      V1 SAT + V2 non-trivial    k = 12 unrolled SMT BMC     `zig test` + `-fstrip .so`
+      2-safety TINI product      V4 reachability + .tla      POSIX dlopen + SHA-256
+                 │                           │                           │
+                 └───────────────────────────┼───────────────────────────┘
+                                             ▼
+                                    [smt_alethe.zig]
+                          Z3 5.3.1 (unsat / counterexample model)
+                                             +
+                         CVC5 1.4.2 (unsat + Alethe proof DAG)
+                                             +
+                       Native Alethe Kernel (DAG + scope + `(cl)`)
+                                             │
+                                             ▼
+                                 [vacuity_mutation.zig]
+                        6-kind ECHIDNA mutation suite (>= 95.0%)
+                                             │
+                                             ▼
+                                      [engine.zig]
+                    warrant.json + receipt.json + Human / JSON / SARIF
+----
+
+== Four empirical lessons discovered during live bring-up
+
+Building and running the engine against real solvers exposed four concrete
+defects that pure specification review missed. Every future phase must preserve
+these invariants:
+
+. *Quantifier E-matching non-termination on SAT witness queries (`V1`/`V2`).*
+  Background axioms written with universal quantifiers — notably
+  `(forall ((x Int)) (=> (> (list_len x) 0) (= (list_len (tail_of x)) (- (list_len x) 1))))`
+  — discharge `unsat` obligations in `< 5 ms`, but cause Z3 model construction
+  to diverge on *satisfiable* queries (`V1` antecedent satisfiability and `V2`
+  postcondition falsifiability) by instantiating an infinite chain
+  `tail_of(tail_of(tail_of(...)))`. Ground-instantiating domain facts onto the
+  in-scope terms keeps obligations strictly inside decidable `QF_UFLIA` so both
+  `sat` and `unsat` terminate in milliseconds.
+. *Eager lexical resolution of pattern binders at recursive call sites.*
+  In `def depth(history), do: case history do [] -> 0; [_ | rest] -> 1 + depth(rest) end`,
+  recording raw AST arguments on `depth(rest)` and lowering them after exiting
+  `case` loses the pattern equality `rest = (tail_of history)`, causing an
+  unbound SMT symbol error. Lowering recursive call arguments *eagerly while
+  pattern bindings are live on `pat_binds`* captures `(tail_of history)` cleanly.
+. *Real weak-specification defect caught in `Verisim.Spec.drift_of/2`.*
+  The initial reference example specified `@post spec(result <= 10_000)` without
+  `result >= 0`. It passed `V1`, `V2` (falsified by `10_001`), and `VC-POST`
+  (207 Alethe steps `QED`), *yet Stage 9's `BoundaryShift` mutant (`-999_999`)
+  survived*, dropping the score to `88.89% < 95.00%` and halting with `Q-603`
+  (exit `5`). Tightening the contract to `@post spec(result >= 0 and result <= 10_000)`
+  killed 9/9 proof-relevant mutants (`100.00%`, 285 Alethe steps `QED`).
+. *ELF Build-ID non-determinism vs load-time NIF hash verification (`Q-303`).*
+  Re-running `zig build-lib` without `-fstrip` embeds distinct metadata on
+  rebuilds, breaking `binary_sha256` receipt pins; conversely, unconditionally
+  rebuilding `.so` during `verify` would overwrite a tampered `.so` before hash
+  comparison. Compiling with `-fstrip -O ReleaseSafe` produces bit-identical
+  shared objects (`sha256 = 7a50a320...`), and `verify` checks an existing `.so`
+  in place without overwriting it unless `--update-receipt` is explicitly passed.
+
+== Concrete implementation roadmap from `v0.1.0-alpha` to `v1.0.0`
+
+=== Milestone M1: BEAM Bytecode & Compiler Tracer Seal (Phase 1 completion)
+
+* *Goal:* Run Quintessence automatically during `mix compile` with zero gap
+  between parsed source and loaded `.beam` chunks.
+* *Tasks:*
+  . Wire `tracers: [Quintessence.Tracer]` into host Mix projects and serialize
+    expanded quoted expressions directly from `@after_compile` callbacks into
+    `qir/v1` JSON.
+  . Inspect compiled `.beam` `ImpT` (imports) and `LitT` chunks in Elixir to
+    reject hidden macro injections (`Q-101`--`Q-105`) even in third-party macros.
+  . Enforce double-compile SHA-256 identity inside `bwrap --unshare-net` so
+    macros reading wall clocks or network state fail closed.
+* *Exit gate:* Every fixture in `tests/quintessence/run_suite.sh` fails at
+  `mix compile` time with identical `Q-1xx` codes.
+
+=== Milestone M2: Idris2 QTT `qir/v1` Checker & Why3/Dedukti Bridge (Phase 2)
+
+* *Goal:* Replace ad-hoc IR assumptions with typechecked `%default total`
+  Idris2 elaboration and standalone `dkcheck` proof checking.
+* *Tasks:*
+  . Compile `src/interface/Abi/Qir.idr` into a small Idris2 validator executable
+    that parses `qir.v1.json`, constructs well-typed `ValidNifSchedule` and
+    `WellTypedKCut` indices, and rejects ill-indexed IR before solver dispatch.
+  . Implement the Alethe-to-Dedukti reconstruction pass (`alethe2dk`) for the
+     propositional resolution + congruence + Farkas linear arithmetic fragment
+    (`la_generic`), eliminating remaining `rewrite_holes` reported in
+    `warrant.json` or marking un-reconstructed steps explicitly.
+* *Exit gate:* `warrant.json` records `rewrite_holes == 0` and passes `dkcheck`
+  for all 12 `Verisim` obligations.
+
+=== Milestone M3: Live Apalache & `occupancy-types` Integration (Phase 3)
+
+* *Goal:* Cross-check native unrolled SMT BMC against `apalache-mc` over the
+  emitted TLA+ modules and integrate upstream `occupancy-types` R2--R3 HWM algebra.
+* *Tasks:*
+  . Add `apalache-mc check --inv=MailboxBound --inv=NoUnwarrantedRemoteClaim --inv=EpochConsistent --length=12`
+    execution to `layer_b.zig` whenever `apalache-mc` is present on `PATH`,
+    parsing `counterexample1.tla` into Elixir source traces.
+  . Extend GenServer protocol extraction from static `@choreography` attributes
+    to check that every `handle_call` / `handle_cast` / `handle_info` body
+    conforms structurally to the declared role projection (session-type
+    projection check).
+  . Import pinned `occupancy-types` HWM bounds once upstream R2--R3 lands.
+* *Exit gate:* Planted body/Face mismatch (e.g. `@choreography` declares `:call`
+  while handler performs an unrecorded `GenServer.cast`) fails with `Q-401`.
+
+=== Milestone M4: `ZigProve` AIR Extractor & Rustler Linear Resource Audit (Phase 4)
+
+* *Goal:* Upgrade Layer C from syntax-guided safety/WCET checks to compiler-IR
+  (`Zig AIR`) machine proofs and Rustler `ResourceArc<T>` linear ownership.
+* *Tasks:*
+  . Extract CFG and basic-block instruction counts from `zig build-obj -femit-llvm-ir`
+    to compute exact cycle/instruction polynomials per target microarchitecture,
+    emitting Lean 4 `tropical-types` proof scripts checked by `lean`.
+  . Add a Rust syn/hir lint pass for `#[rustler::nif]` wrappers verifying that
+    every NIF > `threshold_us` carries `#[nif(schedule = "DirtyCpu")]` and never
+    stores `Env<'a>` or `Term<'a>` past return (`C9`, `C11`).
+* *Exit gate:* Mismatched Rustler schedule vs Zig `MaxPlus` bound fails CI with
+  `Q-305`; `.lean` `MaxPlus` theorem compiles with zero `sorry`.
+
+=== Milestone M5: ECHIDNA Batch Level-5 Service & Production Hardening (Phases 5--6)
+
+* *Goal:* Promote local `TrustLevel 4` Warrants into signed `TrustLevel 5`
+  `COMPLETE` Receipts checked independently by both Rocq (`coqc`) and Lean 4.
+* *Tasks:*
+  . Implement the ECHIDNA gRPC client in `engine.zig` submitting `qir.v1.json`,
+    `quintessence_obligations.v`, `QuintessenceObligations.lean`, and Alethe
+    certificates to the batch farm, verifying Ed25519 signatures on returned
+    `quintessence.receipt/v1` artifacts.
+  . Add persistent content-addressed proof caching keyed on per-obligation
+    `smt_sha256` so incremental edits re-verify in `< 200 ms`.
+  . Publish SARIF 2.1.0 annotations (`--format sarif`) directly into GitHub Code
+    Scanning on pull requests.
+* *Exit gate:* `quintessence verify examples/quintessence --strict --require-level-5`
+  exits `0` with `TrustLevel = 5`, `axioms = []`, and Ed25519 signature verified.
+
+== Running the implementation today
+
+[source,bash]
+----
+# 1. Build native C-ABI library (`libquintessence.so`) and CLI (`quintessence`)
+just build
+
+# 2. Check solver & compiler toolchain readiness
+./src/interface/ffi/zig-out/bin/quintessence doctor
+
+# 3. Verify the full 3-layer Verisim vertical slice (12 QEDs + 6-kind mutation)
+./src/interface/ffi/zig-out/bin/quintessence verify examples/quintessence
+
+# 4. Run all unit, integration, falsifier, tamper, vacuity, and mutation tests
+just test
+
+# 5. Validate RSR repository shape, deed state, and AsciiDoc rendering
+just validate
+----

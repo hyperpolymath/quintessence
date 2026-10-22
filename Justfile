@@ -22,9 +22,9 @@ import? "build/contractile.just"
 mod provision 'build/just/provision.just'
 
 # Project metadata — customize these
-project := "rsr-template-repo"
+project := "quintessence"
 OWNER := "hyperpolymath"
-REPO := "rsr-template-repo"
+REPO := "quintessence"
 version := "0.1.0"
 tier := "infrastructure"  # 1 | 2 | infrastructure
 
@@ -88,39 +88,23 @@ import? "build/just/assess.just"
 # BUILD & COMPILE
 # ═══════════════════════════════════════════════════════════════════════════════
 
-# Build the project with every detected language's toolchain (here: pack/idris2 for
-# the ABI, then `zig build` in src/interface/ffi). Replace the delegation with a
-# body of your own when the project needs a different build.
-build: provision::build
+# Build the project with every detected language's toolchain (`zig build` in src/interface/ffi)
+build:
+    cd src/interface/ffi && zig build -Doptimize=ReleaseSafe
 
 # Build in release mode with optimizations
 build-release *args:
-    # TODO: Replace with your release build command
-    # Examples:
-    #   cargo build --release {{args}}
-    #   MIX_ENV=prod mix compile {{args}}
-    #   zig build -Doptimize=ReleaseFast {{args}}
-    @echo "FAIL: 'just build-release' is not wired yet — nothing was built. Edit the 'build-release' recipe." >&2; exit 1
+    cd src/interface/ffi && zig build -Doptimize=ReleaseSafe {{args}}
 
 # Build and watch for changes (requires entr or similar)
 build-watch:
     @echo "Watching for changes..."
-    # TODO: Customize file patterns for your language
-    # Examples:
-    #   find src -name '*.rs' | entr -c just build
-    #   mix compile --force --warnings-as-errors
-    #   bun run dev
+    find src -name '*.zig' | entr -c just build
 
 # Clean build artifacts [reversible: rebuild with `just build`]
 clean:
     @echo "Cleaning..."
-    # TODO: Customize for your build system
-    #
-    # `build/` is DELIBERATELY ABSENT from this list. It is not an artifact
-    # directory in an RSR repo: it holds 11 tracked files, including
-    # build/just/repo-init.just, which the root Justfile imports at line 65.
-    # Deleting it destroys `just repo-init`, `just verify` and the proof gates.
-    rm -rf target/ _build/ dist/ out/ obj/ bin/
+    rm -rf target/ _build/ dist/ out/ obj/ bin/ src/interface/ffi/zig-out src/interface/ffi/.zig-cache examples/quintessence/priv/native/libverisim_nif.so
 
 # Deep clean including caches [reversible: rebuild]
 clean-all: clean
@@ -130,42 +114,32 @@ clean-all: clean
 # TEST & QUALITY
 # ═══════════════════════════════════════════════════════════════════════════════
 
-# Run every detected language's tests: `zig build test` covers src/interface/ffi
-# (unit tests in src/main.zig, test/integration_test.zig). It compiles only after
-# `just repo-init` has filled the template tokens, so an un-initialised template
-# fails here loudly instead of reporting a pass over nothing.
-test: provision::test
+# Run native Zig unit + integration tests AND the 15-case live verification suite
+test: build
+    cd src/interface/ffi && zig build test
+    bash tests/quintessence/run_suite.sh
 
 # Run tests with verbose output
-test-verbose: provision::test
+test-verbose: test
 
 # Smoke test
-test-smoke:
-    # TODO: Add basic sanity checks
-    @echo "FAIL: 'just test-smoke' is not wired yet — no smoke check ran. Edit the 'test-smoke' recipe." >&2; exit 1
+test-smoke: build
+    ./src/interface/ffi/zig-out/bin/quintessence doctor
+    ./src/interface/ffi/zig-out/bin/quintessence explain Q-401
 
 # Run end-to-end tests (full pipeline: build → run → verify)
-e2e:
+e2e: build
     bash tests/e2e.sh
 
 # Run aspect tests (cross-cutting concern validation)
 aspect:
-    # Aspect tests validate architectural invariants:
-    #   - Thread safety (mutex in FFI modules)
-    #   - ABI/FFI contract (declarations match exports)
-    #   - SPDX compliance (all files have license headers)
-    #   - No dangerous patterns (believe_me, assert_total, etc.)
     bash tests/aspect_tests.sh
 
-# Run benchmarks (performance regression detection). Reports N/A until a language
-# declares some (e.g. a "bench" step in build.zig, [[bench]] in Cargo.toml).
+# Run benchmarks (performance regression detection).
 bench: provision::bench
 
-# Run readiness tests (Component Readiness Grade: D/C/B)
-readiness:
-    # TODO: Replace with your readiness test command. Examples:
-    #   cargo test --test readiness -- --nocapture
-    @echo "FAIL: 'just readiness' is not wired yet — no readiness test ran. Edit the 'readiness' recipe." >&2; exit 1
+# Run readiness tests (Component Readiness Grade)
+readiness: e2e
 
 # Print the current CRG grade (reads from READINESS.md '**Current Grade:** X' line)
 crg-grade:
@@ -207,21 +181,30 @@ fix: fmt
 # ═══════════════════════════════════════════════════════════════════════════════
 
 # Format all source files [reversible: git checkout]
-fmt: provision::fmt
+fmt:
+    zig fmt src/core src/interface/ffi examples/quintessence/priv/native/verisim_nif.zig
+    @if command -v mix >/dev/null 2>&1; then mix format; fi
 
 # Check formatting without changes
-fmt-check: provision::fmt-check
+fmt-check:
+    zig fmt --check src/core src/interface/ffi examples/quintessence/priv/native/verisim_nif.zig
+    @if command -v mix >/dev/null 2>&1; then mix format --check-formatted; else echo "note: mix not installed on PATH — skipped Elixir format check"; fi
 
-# Run linter (`zig fmt --check` on src/interface/ffi; like `test`, it parses the
-# FFI sources only after `just repo-init` has filled the template tokens)
-lint: provision::lint
+# Run repository, documentation, safety, and formatting gates
+lint:
+    bash scripts/check-root-shape.sh .
+    bash scripts/check-no-placeholders.sh .
+    bash scripts/check-no-a2ml.sh .
+    bash scripts/check-adoc-renders.sh .
+    bash scripts/scan-dangerous.sh .
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # RUN & EXECUTE
 # ═══════════════════════════════════════════════════════════════════════════════
 
-# Run the application (N/A for a library; wire a "run" step or executable to enable)
-run: provision::run
+# Run full three-layer verification on the reference Verisim example
+run *args: build
+    ./src/interface/ffi/zig-out/bin/quintessence verify examples/quintessence {{args}}
 
 # Run with verbose output
 run-verbose: run
@@ -574,7 +557,7 @@ opsm: provision::opsm
 
 # Guided tour of key features
 tour:
-    @echo "=== rsr-template-repo Tour ==="
+    @echo "=== quintessence Tour ==="
     @echo ""
     @echo "1. Project structure:"
     @ls -la
@@ -589,12 +572,12 @@ tour:
 
 # Open feedback channel with diagnostic context
 help-me:
-    @echo "=== rsr-template-repo Help ==="
+    @echo "=== quintessence Help ==="
     @echo "Platform: $(uname -s) $(uname -m)"
     @echo "Shell: $SHELL"
     @echo ""
     @echo "To report an issue:"
-    @echo "  https://github.com/hyperpolymath/rsr-template-repo/issues/new"
+    @echo "  https://github.com/hyperpolymath/quintessence/issues/new"
     @echo ""
     @echo "Include the output of 'just doctor' in your report."
 

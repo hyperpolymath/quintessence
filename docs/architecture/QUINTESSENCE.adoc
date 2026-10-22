@@ -1,0 +1,2425 @@
+// SPDX-License-Identifier: CC-BY-SA-4.0
+// Copyright (c) 2026 Jonathan D.A. Jewell <j.d.a.jewell@open.ac.uk>
+= Quintessence: A Verification Suite for Elixir/OTP
+:toc:
+:toc-placement: preamble
+:toc-title: Contents
+:doctype: article
+:revdate: 2026-10-22
+:revnumber: 0.1.0-draft
+
+[IMPORTANT]
+.Status of this document
+====
+This is an architectural specification and MVP roadmap, not an implemented
+verifier. No Elixir, Idris2, Zig, Why3, Agda, Apalache, or ECHIDNA toolchain is
+invoked by this checkout, and none of the code printed here has been compiled or
+typechecked in it. Code blocks are *reference material*: they fix interfaces,
+names, and proof obligations so that implementation work has an unambiguous
+target. Claims about the estate libraries are pinned to the revisions and proof
+status recorded in link:#foundations[Foundation pinning]; where a library is
+partial, this document says so instead of rounding it up.
+
+The normative words are MUST, MUST NOT, SHOULD, and MAY. A statement marked
+*assumption* is part of the trusted computing base until a work package
+discharges it.
+====
+
+== Summary
+
+Quintessence is a verification suite for Elixir that proves three things the
+existing BEAM toolchain does not:
+
+. *Functional correctness* of a pure, total Elixir subset: every function
+  satisfies its pre- and postcondition for all inputs, not a sample.
+. *Protocol and knowledge correctness* of OTP processes: a `GenServer` may claim
+  that a remote process committed a state only when a causal reply warrants that
+  claim; casts and one-way sends never do.
+. *Native-boundary safety*: an Elixir NIF stub imports the exact Idris2 ABI
+  specification and ZigProve receipt for its Zig implementation, proving memory
+  safety and a `MaxPlus` worst-case bound that decides whether the NIF may run on
+  a normal scheduler or must be tagged `.dirty_cpu`.
+
+The architecture is one pipeline with three obligation families:
+
+[source,text]
+----
+Elixir source
+  |
+  v
+[G0] deterministic macro firewall        (allowlist, sandbox, bytecode audit)
+  |
+  v
+[G1] subset checker + Face elaborator    (@cap @pre @post @secret @choreography)
+  |
+  v
+Core Spec IR (.qir, Idris2, QTT, total, content-addressed)
+  |---------------------+----------------------+
+  v                     v                      v
+Layer A               Layer B                Layer C
+Why3 / SMT            K-CUT / Apalache       Idris2 ABI / ZigProve
+  |                     |                      |
+  +----------+----------+----------+-----------+
+             v
+        ECHIDNA dispatch
+             |
+             v
+   INCOMPLETE Warrant (local)
+             |
+             v
+   batch Coq + Lean check
+             |
+             v
+   COMPLETE Receipt (kernel-checked)
+----
+
+The single-sentence version: *quintessence filters Elixir through a deterministic
+macro firewall, elaborates the surviving subset into a small Idris2 Core Spec IR,
+splits the proof obligations into sequential, protocol, and native families, and
+returns evidence as either an incomplete local Warrant or a complete,
+kernel-checked Receipt.*
+
+The MVP is deliberately narrower than the architecture: one pure module, one
+two-message request/reply protocol, and one verified NIF, proved end to end with a
+Receipt. Section <<roadmap>> states the phases and their exit criteria.
+
+The decision to split the suite this way, and the alternatives that were
+rejected, are recorded in
+link:../decisions/0004-three-layer-architecture.adoc[ADR-0004].
+
+== The gap and the thesis
+
+=== What Elixir already has
+
+Elixir's tooling is unusually good at *runtime-shaped* questions:
+
+* Dialyzer answers whether a program is likely to fail with a type error, using
+  success typing over compiled BEAM code.
+* Elixir 1.17 and later carry gradual set-theoretic types in the compiler,
+  inferring types from patterns and guards and warning on contradictions.
+* PropEr and StreamData answer whether a property survives a large, shrinking
+  sample of generated inputs.
+* Concuerror answers whether a concurrent Erlang program can reach a bad schedule
+  under a systematic exploration of interleavings, within a bound.
+* ExUnit answers whether the examples the author thought of pass.
+
+None of these answers, for all inputs:
+
+* Does `commit/2` return a digest equal to the hash of its payload, and does the
+  state version advance by exactly one?
+* After `GenServer.cast(replica, {:commit, v})`, may the caller claim the replica
+  committed `v`?
+* Does the NIF write past the end of the caller's binary if the payload length is
+  `2^32 - 1`?
+* Can a normal-scheduler NIF occupy a scheduler thread for 4 ms because its input
+  size was not in the benchmark?
+
+The thesis of quintessence is that these are *three different verification
+problems*, and collapsing them into one type system or one test harness is why
+the answers are usually missing. They need separate logics, separate evidence,
+and one shared specification object.
+
+=== The three boundaries
+
+[cols="1,2,3",options="header"]
+|===
+| Boundary | Failure mode | Required logic
+
+| Sequential functional core
+| A pure function returns the wrong value, loops forever, or leaks a secret into
+  a public result.
+| Refinement types over a total functional calculus; VCs discharged by
+  SMT/Why3 and kernel-checked through Dedukti.
+
+| OTP protocol and knowledge
+| A process claims a remote state commitment it cannot know; a mailbox grows
+  without bound; a restart silently invalidates an invariant.
+| Graded choreographic types and epistemic warrants; bounded model checking of
+  the concrete protocol; occupancy grades.
+
+| Native ABI
+| A Zig NIF corrupts the BEAM heap, retains an `Env`-bound term, double-frees a
+  resource, or overruns a scheduler timeslice.
+| QTT linear resource types; ZigProve memory obligations; `MaxPlus` worst-case
+  cost; receipt import at load time.
+|===
+
+=== Design principles
+
+. *Small trusted kernel, loud boundary.* The IR is small; each translation is
+  named, versioned, and part of the TCB until proved. Nothing is "verified"
+  because a tool exited zero.
+. *No silent green.* `unknown`, `timeout`, `unsupported`, `vacuous`, and
+  `assumed` are distinct statuses and none of them is a pass.
+. *Reuse the estate's metatheory, do not re-prove it.* `choreographic-types`,
+  `secret-types`, `epistemic-types`, `tropical-types`, and `occupancy-types` are
+  imported at pinned revisions; quintessence builds instances and adapters, not
+  parallel theories.
+. *Deterministic and replayable.* Expansion, elaboration, VC generation, and
+  evidence assembly are content-addressed. The same source and tool pins produce
+  the same `.qir` and the same obligation hashes.
+. *Fail closed on the native boundary.* A missing, stale, or mismatched receipt
+  prevents the NIF from loading; it does not degrade to a warning.
+. *The specification is the artifact.* The Face annotations, the `.qir`, the
+  Warrant, and the Receipt are reviewable objects, not compiler internals.
+
+=== Non-goals
+
+* Verifying arbitrary Elixir. The verified subset is a strict, documented
+  fragment; everything outside it is rejected or explicitly `@trusted` with a
+  receipt.
+* Replacing tests, Dialyzer, or property-based testing. Quintessence consumes
+  their results as filters and counterexample sources.
+* Proving the BEAM runtime, the Erlang scheduler, or the Zig compiler. Those are
+  assumptions with pinned versions and documented failure impact.
+* Distributed-systems liveness under arbitrary partitions, Byzantine faults, or
+  dynamic role creation. The MVP is a finite, authenticated, crash-stop model.
+* Verifying arbitrary C. The supported native surface is safe Zig called through
+  a narrow C ABI, with no inline assembly and no unaudited `@cImport`.
+
+[[architecture]]
+== Architecture at a glance
+
+=== Components
+
+[cols="1,3,3",options="header"]
+|===
+| Component | Responsibility | Written in
+
+| `quintessence` front end
+| Compiler tracer, macro firewall, subset checker, Face elaborator, `.qir`
+  emitter, `mix verify`.
+| Elixir (the tool runs on the BEAM it verifies) plus a small Rust/NIF helper for
+  bytecode inspection if needed.
+
+| Core Spec IR
+| Sorts, terms, contracts, protocols, NIF declarations, goals, provenance.
+| Idris2, `%default total`, QTT.
+
+| Layer A backend
+| Elixir subset to WhyML; VC splitting; SMT dispatch; Dedukti witness
+  reconstruction for the decidable fragment.
+| Elixir + Why3 OCaml API + a Dedukti pretty-printer.
+
+| Layer B backend
+| Global/local types, K-CUT obligation generation, Agda instance emission,
+  TLA+ emission for Apalache.
+| Elixir + Agda (reused library) + TLA+.
+
+| Layer C backend
+| Idris2 ABI model, ZigProve receipt import, `MaxPlus` bound checking, NIF stub
+  generation.
+| Idris2 + Zig + Elixir.
+
+| ECHIDNA
+| Obligation dispatch, solver portfolio, certificate verification, axiom
+  tracking, trust levels, mutation testing.
+| Rust (existing estate service).
+
+| Evidence store
+| Content-addressed Warrants and Receipts, signatures, replay logs.
+| Append-only files plus a small index; no database in the MVP.
+|===
+
+=== Data flow
+
+. `mix verify` starts a compiler run with the quintessence tracer installed.
+. G0 records every macro invocation, expands the module in a sandboxed OS
+  process, and hashes the canonical expanded AST. Any macro outside the
+  allowlist, any banned call, or any non-deterministic expansion is a hard error.
+. G1 checks the expanded AST against the subset grammar and the Face
+  well-formedness rules, then elaborates it to `Core.Module`.
+. The `.qir` emitter writes a canonical, content-addressed module. The hash is
+  the identity of the specification from this point on.
+. The layer backends project the `.qir` into WhyML, Agda/TLA+, and Idris2/Zig
+  obligations. Projection is total on the subset; an unsupported construct is a
+  `Q-2xx` error, never a silent skip.
+. ECHIDNA receives obligations as `Goal` records, runs the configured portfolio,
+  and returns a `Warrant` per obligation and per module.
+. A local Warrant is `INCOMPLETE` by construction: it records which kernel
+  checked what, and which obligations are still oracle-only.
+. The batch stage re-proves (or, in `transport` mode, translates and checks) each
+  Warrant obligation in Coq and Lean. Two independent kernel QEDs plus no
+  forbidden axioms promote the Warrant to a `COMPLETE Receipt` at ECHIDNA trust
+  level 5.
+. `mix verify` gates on the receipt policy: which layers require a Receipt,
+  which may ship with an Incomplete Warrant, and which claims are forbidden
+  outright.
+
+=== The trust ledger
+
+Every proof is only as strong as the assumptions it rests on. The ledger is part
+of the specification, not an appendix.
+
+[cols="2,3,3,2",options="header"]
+|===
+| Component | Assumed | Evidence / mitigation | If wrong
+
+| Elixir parser and macro expander
+| Parses and expands source according to the pinned Elixir version.
+| G0 double expansion in two sandboxes; canonical AST hash; pinned compiler.
+| The verified program is not the program that runs.
+
+| Quintessence elaborator
+| Maps the subset AST to IR without changing meaning.
+| Small IR; golden tests; a proof-producing translation is a Phase 5 work
+  package; every IR node carries source provenance.
+| VCs are about a different program.
+
+| Why3
+| VC generation and splitting are sound for the WhyML fragment.
+| Pinned Why3; `why3 replay`; cross-check with an independent generator for the
+  MVP fragment.
+| A false VC is proved.
+
+| SMT solver
+| An `unsat` answer is correct.
+| Proof certificates where the solver emits them; otherwise the obligation is
+  `UNCHECKED` and cannot enter a Receipt. Solver binary hashes pinned by
+  ECHIDNA's integrity layer.
+| A satisfiable goal is reported proved.
+
+| `why3-dk` reconstruction
+| The `.dk` term is a proof of the same goal.
+| Reconstruction checked by `dkcheck`; the translator is a named TCB component;
+  Phase 5 replaces it with a proved translation for the fragment.
+| Dedukti checks a different theorem.
+
+| Dedukti kernel
+| Type checking is sound.
+| Small kernel; pinned `dkcheck`.
+| A false proof is accepted.
+
+| Coq and Lean kernels
+| The batch check is sound.
+| Two independent small kernels; ECHIDNA `TrustLevel::Level5`; axiom tracker.
+| A false Receipt is issued.
+
+| Apalache
+| The TLA+ encoding is a faithful abstraction of the protocol, and the checked
+  instance is bounded.
+| Encoding tests, trace replay, and a refinement obligation to the Agda
+  semantics; bounded results are labelled `BOUNDED`.
+| A protocol bug is missed outside the bound.
+
+| Agda + `choreographic-types`
+| The imported K-CUT theorems apply to the emitted instance.
+| Pinned `--safe --without-K` library; instance checked by Agda; scope stated in
+  <<foundations>>.
+| A knowledge claim exceeds the proved fragment.
+
+| Idris2
+| QTT and totality checking are sound; `%foreign` declarations match the ABI.
+| Pinned compiler; generated C header compared to the Zig exports.
+| A linearity or layout claim is false.
+
+| ZigProve
+| The receipt's obligations cover the compiled Zig and the binary hash matches.
+| Receipt schema, obligation list, binary SHA-256, reproducible build; load-time
+  check in the NIF stub.
+| Heap corruption or an unbounded NIF ships.
+
+| Rustler
+| `ResourceArc`, term encoding, and `Env` lifetimes are sound.
+| Upstream version pinned; no raw pointers in the Rust glue; the Zig core is
+  `extern "C"` and allocation-free at the boundary.
+| Use-after-free or a retained term.
+
+| BEAM scheduler
+| A normal NIF occupies a scheduler thread for about one timeslice (roughly
+  1 ms); dirty schedulers are separate pools.
+| Documented ERTS behaviour; `MaxPlus` bound with a safety margin; concurrency
+  bound on dirty NIFs.
+| Latency spikes or dirty-pool starvation.
+|===
+
+The ledger is the answer to "who verified the verifier?". It does not make the
+TCB disappear; it makes it reviewable.
+
+[[contrast]]
+== Relationship to existing BEAM tooling
+
+Quintessence is complementary, not competitive. The useful question is not
+"which tool is stronger" but "which question does each tool answer, and what do I
+do with the answer".
+
+[cols="2,3,3,3",options="header"]
+|===
+| Tool | Question it answers | Method and guarantee | What it cannot answer
+
+| Dialyzer
+| Will this program fail with a type error at runtime?
+| Whole-program success typing over BEAM bytecode. Optimistic: it aims for no
+  false positives, so it can miss errors. No annotations required.
+| Functional contracts, refinement properties, protocol knowledge, native memory
+  or timing.
+
+| Elixir 1.17+ set-theoretic types
+| Do patterns, guards, and calls agree on types?
+| Gradual set-theoretic types in the compiler; inference from patterns and
+  guards; sound gradual typing for the typed fragment. Warnings, not proofs.
+| Refinements such as `digest = hash(payload)`, termination, information flow,
+  cross-process knowledge, NIF safety.
+
+| PropEr / StreamData
+| Does this property survive a large sample?
+| Property-based generation with shrinking. Finds counterexamples; never proves
+  absence.
+| Universal quantification, protocol invariants over all schedules, native
+  memory safety.
+
+| Concuerror
+| Can this concurrent program reach a bad schedule within the explored bound?
+| Systematic scheduling exploration with dynamic partial-order reduction.
+| Unbounded schedules, knowledge logic, functional contracts, native code.
+
+| Quintessence
+| Does this function meet its contract for all inputs, may this process claim
+  this knowledge, and is this NIF memory- and scheduler-safe?
+| Deductive VCs plus SMT and kernel checking; graded choreography plus bounded
+  model checking; QTT ABI plus ZigProve plus `MaxPlus`. Evidence is a Warrant or
+  Receipt.
+| Arbitrary Elixir outside the subset; the BEAM kernel; Byzantine distribution;
+  arbitrary C.
+|===
+
+=== Four bugs, four tools
+
+[cols="1,3,4",options="header"]
+|===
+| Bug | Who catches it today | Who catches it in quintessence
+
+| `commit/2` returns the previous digest for an empty payload.
+| Possibly a unit test; set-theoretic types see `binary()` and say nothing.
+| Layer A postcondition `result.digest = hash(payload)`; SMT finds the empty
+  payload as a counterexample if the implementation is wrong.
+
+| `handle_cast(:commit, ...)` is used and the caller then claims the replica
+  committed.
+| Concuerror may find a schedule where the message is lost, but only if the
+  model says so; no tool rejects the claim statically.
+| Layer B's K-CUT-WARRANT rule: a cast has no causal reply, so
+  `K_caller(committed(replica, v))` is not derivable. `Q-401` at elaboration.
+
+| A NIF writes one byte past a 1 MiB buffer.
+| Nothing in the BEAM toolchain; a crash or silent corruption at runtime.
+| Layer C's ZigProve bounds obligation; the receipt is missing or refuted, so the
+  NIF cannot load.
+
+| A selective `receive` mailbox grows without bound under a slow consumer.
+| Concuerror at a bound; a production memory alarm.
+| Layer B occupancy grade (`HWM`) plus a `MaxPlus` service bound yields a
+  backlog bound; if it cannot be proved, the spec requires backpressure.
+|===
+
+== The Core Spec IR
+
+The IR exists so that the three layers cannot disagree about what was specified.
+It is a *deep embedding*: a first-order data type in Idris2, total by
+construction, with explicit provenance. It is not a compiler IR for execution;
+nothing runs the IR. It is the proof object's syntax.
+
+=== Design constraints
+
+* *Small.* Roughly 20 term constructors. If a construct cannot be given a
+  meaning in all three layers, it does not belong in the core; it is a primitive
+  with a named theory.
+* *Total.* `%default total`; no `believe_me`, `postulate`, `assert_total`, or
+  `partial`. The IR's type checker is a total function.
+* *Content-addressed.* Canonical serialization (I-JSON/JCS for the interchange
+  form, CBOR for the binary form), SHA-256 over the canonical bytes. Names are
+  resolved to fully qualified atoms before hashing; source locations are
+  excluded from the hash and carried as provenance.
+* *Layer-neutral.* A `Term` has no Elixir syntax. `Send`, `Recv`, `Call`, and
+  `Cast` are protocol primitives; `NifCall` and `Budget` are native primitives;
+  `Secret` and `Declassify` are information-flow primitives.
+* *QTT-aware.* Proofs are erased (`0`); linear handles are `1`; ordinary data is
+  unrestricted. The IR records multiplicities so Layer C can check them.
+* *Versioned.* `qir/v1`. A change to the term grammar or the canonical form is a
+  major version and invalidates cached evidence.
+
+=== Reference Idris2 module
+
+The following is the core of `Quintessence.Core`. It is deliberately compact;
+the full module adds decidable equality, a total scope checker, and a canonical
+pretty-printer.
+
+[source,idris2]
+----
+module Quintessence.Core
+
+import Data.List
+import Data.String
+
+%default total
+
+public export
+data Sort = SType | SData | SProp | SProtocol | SCap | SSecret | SCost
+
+public export
+data Role = MkRole String
+
+public export
+data Label = MkLabel String
+
+public export
+data Cap = CRead | CWrite | CNif String | CClock | CRand | CLog
+         | CNet | CFs | CPort | CEval
+
+public export
+data SecretLabel = SPublic | SInternal | SConfidential | SSecret
+
+public export
+data Layer = LA | LB | LC
+
+public export
+data Origin = MkOrigin
+  { file      : String
+  , line      : Nat
+  , column    : Nat
+  , macroPath : List String
+  }
+
+public export
+data Pat
+  = PVar String
+  | PWild
+  | PCon String (List Pat)
+  | PLit String
+
+public export
+data Term
+  = Var String
+  | Const String
+  | Con String (List Term)
+  | App Term (List Term)
+  | Lam String Term
+  | Pi String Term Term
+  | Let String Term Term
+  | Match Term (List (Pat, Term))
+  | Prim String (List Term)
+  | Do (List Term)
+  | Send Role Role Label Term
+  | Recv Role Role Label Term
+  | Call Role Role Label Term Term       -- payload, continuation
+  | Cast Role Role Label Term
+  | NifCall String (List Term)
+  | With Term Term                       -- acquire, use, release
+  | Budget Nat Term                      -- microseconds, body
+
+public export
+record Contract where
+  constructor MkContract
+  pre      : Term
+  post     : Term
+  inv      : Maybe Term
+  measure  : Maybe Term
+  caps     : List Cap
+  secrets  : List (String, SecretLabel)
+
+public export
+record Goal where
+  constructor MkGoal
+  id         : String
+  layer      : Layer
+  moduleName : String
+  function   : String
+  hypotheses : List Term
+  conclusion : Term
+  origin     : Origin
+
+public export
+record NifDecl where
+  constructor MkNifDecl
+  name        : String
+  abiModule   : String
+  receiptHash : String
+  schedule    : Schedule
+  boundUs     : Nat
+
+public export
+data Schedule = Normal | DirtyCpu | DirtyIo
+
+public export
+record Protocol where
+  constructor MkProtocol
+  roles   : List Role
+  globals : List Term
+  knows   : List (Role, Term)
+  forbids : List Term
+
+public export
+record Module where
+  constructor MkModule
+  name      : String
+  decls     : List Term
+  contracts : List (String, Contract)
+  protocols : List Protocol
+  nifs      : List NifDecl
+  digest    : String
+
+public export
+record Proof (p : Type) where
+  constructor MkProof
+  0 prf : p
+----
+
+The `0` in `Proof` is not decoration. It is the QTT multiplicity that says the
+proof is erased at runtime and may be used any number of times in type checking
+without becoming a runtime value. The IR's `Contract` carries terms, not proofs;
+the *goals* generated from it are what the backends prove.
+
+=== Elaboration
+
+`Quintessence.Elaborate` is a total function from the checked subset AST to
+`Module`. It performs:
+
+. Name resolution (local variables, module aliases, struct fields, imported
+  pure functions).
+. Sort checking (a term has exactly one sort; `SProtocol` only in Layer B,
+  `SCost` only in Layer C).
+. Contract well-formedness (`pre`, `post`, `inv` are `SProp`; `measure` is
+  `SCost` or `SData`; `caps` is a subset of the module's declared footprint;
+  secret labels form a lattice element).
+. Provenance attachment (every node gets `Origin`, including the macro path
+  recorded by G0).
+. Canonicalization (alpha-renaming, literal normalization, map key ordering,
+  binary literal encoding).
+
+The elaborator is part of the TCB. The mitigation is not "trust us": it is a
+small IR, a golden test corpus with hand-checked `.qir`, and a Phase 5
+proof-producing translation for the core fragment. Until then, the specification
+says `elaborator: assumed` in the receipt.
+
+=== Why Idris2
+
+* Dependent types let the IR's typing rules and the evidence objects live in the
+  same language as the proofs about them.
+* QTT gives linearity for the ABI layer without a separate linear-logic
+  implementation.
+* `%default total` matches the estate's proof discipline; the same gate rejects
+  `believe_me` and `postulate`.
+* The checker can be compiled to a native binary and run offline; it does not
+  need to run on the BEAM.
+* It is already the estate's ABI language (`src/interface/Abi` in this template),
+  so the boundary has one fewer translation.
+
+The alternative — a Rust IR with hand-written checkers — would be faster to
+build but would put the IR's metatheory outside a proof assistant. That is the
+wrong trade for a verification suite.
+
+[[layer-a]]
+== Layer A: the sequential functional subset
+
+Layer A is the part of Elixir that can be given a mathematical meaning without
+the BEAM: pure functions over algebraic data, with pattern matching, guards,
+immutable maps/lists/binaries, and structural recursion. Everything else is
+pushed to Layer B or C, or rejected.
+
+The full grammar, typing rules, Why3 translation, and firewall algorithm are in
+link:QUINTESSENCE-LAYER-A.adoc[Layer A]. This section fixes the contract.
+
+=== Allowed subset
+
+[cols="2,3,2",options="header"]
+|===
+| Construct | Allowed form | Rejected form
+
+| Literals
+| integers, atoms, booleans, binaries, tuples, lists, maps with literal keys,
+  structs
+| floats in verified code; PIDs, references, ports, functions
+
+| Variables and binding
+| `=` with an irrefutable pattern; `case`; `with` after expansion to `case`
+| `pin` on mutable-looking state; rebinding that changes a refinement without a
+  proof
+
+| Functions
+| named `def`/`defp` with a single clause group; total recursion with `@measure`
+| `defdelegate` to unverified code; `apply/3`; dynamic dispatch; closures that
+  escape
+
+| Guards
+| `is_integer/1`, `is_binary/1`, `is_atom/1`, `is_list/1`, `is_map/1`,
+  `byte_size/1`, `length/1`, comparisons, arithmetic, `in`, `and`/`or`/`not`
+| guards calling arbitrary functions; `is_function/1`; `is_pid/1`; `node/0`
+
+| Collections
+| `List` whitelist, `Map.get/put/fetch/has_key?/keys/values/merge`, `Enum.map`,
+  `Enum.filter`, `Enum.find`, `Enum.reduce` with a decreasing measure
+| `hd/1`, `tl/1`, `Map.fetch!`, `Enum.at/2`, lazy streams, `for` comprehensions
+  in the MVP
+
+| Binaries
+| `byte_size/1`, `binary_part/3`, `<>`, byte-aligned pattern matching
+| bit-level matching at non-byte offsets; `:binary.copy` without a size bound
+
+| Errors
+| `{:ok, v}` / `{:error, reason}` returned as data
+| `raise`, `throw`, `exit`, `try/rescue/catch` in the pure subset
+
+| Concurrency
+| none in Layer A
+| `spawn`, `send`, `receive`, `Task`, `Agent`, `GenServer`, `Port`
+|===
+
+The subset is intentionally smaller than "what the compiler accepts". A function
+outside the subset is not silently skipped: the elaborator emits `Q-201` with the
+source location and the first unsupported construct. The author either rewrites
+the function, moves it to a `@trusted` boundary with a receipt, or excludes the
+module from `mix verify`.
+
+=== Types and refinements
+
+The base sorts are `integer`, `nat`, `boolean`, `atom`, `binary`, `bitstring`,
+`list(a)`, `map(k, v)`, `tuple(a, b, ...)`, `struct(Module)`, `option(a)`, and
+`result(a, e)`. Refinements are written `{x : T | phi}` and are generated from
+`@pre`, `@post`, guards, and pattern matches.
+
+A pattern match refines the scrutinee in each branch. For example,
+
+[source,elixir]
+----
+case Map.fetch(state.entries, id) do
+  {:ok, entry} -> entry.digest
+  :error -> <<0::256>>
+end
+----
+
+refines `state.entries` with `id in keys(state.entries)` in the first branch and
+`id not in keys(state.entries)` in the second. Exhaustiveness is checked before
+the VCs are generated; a non-exhaustive match is `Q-202`, not a runtime
+`CaseClauseError` waiting to happen.
+
+=== Totality and termination
+
+Every recursive function MUST carry a `@measure` expression that is a natural
+number and decreases on every recursive call. The elaborator generates the
+decrease obligations; Why3 discharges them with the same SMT portfolio. The
+accepted measures are:
+
+* structural size of a list, map, binary, or tuple;
+* a lexicographic combination of measures;
+* a user-supplied `nat`-valued function whose decrease is proved.
+
+General recursion, mutual recursion without a lexicographic measure, and
+`Enum.reduce` without a decreasing measure are rejected. This is the price of
+totality, and it is non-negotiable: a function that may not terminate has no
+postcondition.
+
+=== Why3 projection
+
+[cols="2,3",options="header"]
+|===
+| Elixir / IR | Why3
+| `integer` | `int`, with range refinements where the ABI is fixed-width
+| `nat` | `int` plus `0 <= x`
+| `binary` | `bytes` (Why3 `bytes.Bytes`) plus a length function
+| `list(a)` | `list a`
+| `map(k, v)` | `map k v` (functional, finite)
+| `struct(M)` | record with one field per verified field
+| `case` | `match`
+| guard | `if`
+| recursive `def` | `let rec` with `variant { measure }`
+| `{:ok, v}` / `{:error, e}` | `result v e`
+| `@pre` | `requires`
+| `@post` | `ensures`, with `old` and `result`
+| `@invariant` | `invariant` on loops (after `Enum` expansion)
+|===
+
+A pure function such as
+
+[source,elixir]
+----
+@pre spec(byte_size(payload) <= 1_048_576)
+@post spec(byte_size(result) == 32)
+def digest(payload), do: Verisim.Spec.digest_of(payload)
+----
+
+is projected to a WhyML `let` with `requires`/`ensures`. `Verisim.Spec.digest_of`
+is the logical model, and it is projected as an uninterpreted function with its
+own contract. A NIF call is *not* projected into Layer A at all: a NIF is outside
+the subset, and its stub is checked by Layer C against the same model. This is the
+key discipline: Layer A proves the functional contract relative to the logical
+model; Layer C proves the native implementation refines the model. Neither layer
+assumes the other.
+
+=== Secrets and capabilities
+
+`@secret` labels every verified value with an element of the two-point (MVP) or
+generic (Phase 4) lattice. The typing judgment is
+
+[source,text]
+----
+Gamma |- e : {v : T | phi} @ ell ; Sigma
+----
+
+where `ell` is the confidentiality label and `Sigma` is the capability
+footprint. The rules are the standard termination-insensitive noninterference
+rules: a public output may depend only on public inputs; a secret may flow to a
+secret; a public-to-secret flow is allowed; a secret-to-public flow requires an
+explicit `@declassify` with a reason and a proof obligation.
+
+The composition rule is MPR R5. It is not enough to check each function in
+isolation: the *product* of capabilities must not form an exfiltration corridor.
+In Elixir terms, a process that holds both `:fs` and `:net` must not pass a value
+derived from a file into a network send without a declassification. The
+elaborator builds the footprint product for each process and checks the
+corridor obligations. The canonical rejected shape is
+
+[source,elixir]
+----
+@cap [read: [:fs], send: [:net]]
+def exfiltrate(path, socket) do
+  data = File.read!(path)          # banned: File authority
+  :gen_tcp.send(socket, data)      # banned: net authority
+end
+----
+
+Both calls are outside the pure subset, so the example is rejected twice: once
+by the capability checker (ambient `File` authority) and once by the macro
+firewall (`File.read!` is not on the allowlist). The point of R5 is that a
+future verified `read_file` and `send_socket` pair would still be rejected as a
+composition unless the label flow is proved safe.
+
+The `@cap` footprint is an MPR `Sigma`: a finite map from capability names to
+the resources they may touch. `File`, `System`, `Port`, and `Code.eval_*` are
+ambient authorities and are absent from the default `Sigma`; a module that needs
+them must say so and carry a receipt. The MPR adapter is pinned separately; see
+<<foundations>>.
+
+=== The macro-expansion firewall
+
+Elixir macros run arbitrary code at compile time. A subset checker that runs
+after expansion has already executed the attacker's code. The firewall is
+therefore a *process* boundary, not an AST convention.
+
+[cols="1,2,3",options="header"]
+|===
+| Gate | What it does | Failure code
+
+| G0a: static allowlist
+| A compiler tracer records every `{:remote_macro, ...}` and `{:local_macro,
+  ...}` event. Each macro module/name/arity must be on the allowlist, or the
+  module must carry a `@trusted_macro` receipt. `Code.eval_*`, `Code.compile_*`,
+  `Module.create/3`, dynamic `apply/3`, and `:erlang.load_nif` are rejected
+  outright.
+| `Q-101` to `Q-109`
+
+| G0b: sandboxed deterministic expansion
+| Expansion runs in a separate OS process with a read-only source tree, no
+  network, no writable temp, a fixed locale/timezone/`SOURCE_DATE_EPOCH`, and a
+  fixed random seed. The canonical expanded AST is hashed. The expansion is run
+  twice; a differing hash is `Q-110` (non-deterministic macro).
+| `Q-110`, `Q-111`
+
+| G0c: bytecode import audit
+| After compilation, `:beam_lib.chunks/2` is used to read `:imports` and
+  `:atoms`. Every imported module/function must be on the verified allowlist;
+  the atom table must not contain banned capabilities. This catches a macro that
+  emitted a call the AST gate did not see.
+| `Q-112`, `Q-113`
+|===
+
+The firewall is deterministic, not omniscient. A macro can still compute a
+different *value* from the same inputs if it reads an allowed clock or a
+persistent term; that is why G0b fixes the environment and double-expands. A
+macro can still be malicious within the allowlist; that is why the allowlist is
+small and reviewed. The trust ledger lists the compiler and the allowlist as
+assumptions.
+
+[[face]]
+== The Face: native contract and choreography syntax
+
+The Face is the surface language. It is made of module attributes, so it works
+with existing Elixir tooling, editors, and code review. The attributes are
+**declarative literals**: `@cap`, `@secret`, `@choreography`, and `@budget`
+accept only literal data; `@pre`, `@post`, `@measure`, and `@invariant` accept
+only `spec(...)` quoted expressions. An attribute that calls arbitrary code at
+compile time is `Q-203`.
+
+=== Attributes
+
+[cols="1,2,2,3",options="header"]
+|===
+| Attribute | Scope | Elaborates to | Meaning
+
+| `@cap`
+| module or function
+| `Contract.caps`, MPR `Sigma`
+| The capability footprint: `read`, `write`, `call` (with module/function/arity),
+  `clock`, `rand`, `log`. Ambient `fs`, `system`, `port`, `eval` are absent by
+  default.
+
+| `@pre`
+| function (accumulates)
+| `Contract.pre`
+| A conjunction of assumptions. A `@pre` that is not used in any proof is marked
+  a *guard* and must be checked by code, not assumed.
+
+| `@post`
+| function (accumulates)
+| `Contract.post`
+| A conjunction over `result`, `old`, `new_state`, and `effects`. `old` is the
+  pre-state; `new_state` is the state returned by a handler; `result` is the
+  reply or return value.
+
+| `@invariant`
+| module or function
+| `Contract.inv`
+| A state invariant preserved by every handler. The elaborator generates
+  preservation obligations for each handler and a one-time establishment
+  obligation for `init/1`.
+
+| `@secret`
+| module or function
+| `Contract.secrets`
+| Labels fields, parameters, or locals. The default lattice is
+  `:public < :internal < :confidential < :secret`.
+
+| `@declassify`
+| function
+| `Declassify` term plus obligation
+| An explicit secret-to-public release with a reason and a named assumption or
+  proof. Silently labelling a hash of a secret as public is a `Q-204`.
+
+| `@measure`
+| recursive function
+| `Contract.measure`
+| A `nat`-valued termination measure; decrease obligations are generated for
+  every recursive call.
+
+| `@choreography`
+| module
+| `Protocol`
+| Roles, messages, knowledge claims, and forbidden claims. See below.
+
+| `@role`
+| function
+| `Protocol` role binding
+| Which role the handler runs as.
+
+| `@handles`
+| function
+| `Protocol` message binding
+| Which `{channel, label}` the handler implements, e.g. `{:call, :commit}`.
+
+| `@nif`
+| function
+| `NifDecl`
+| Marks an Elixir stub as a NIF import; requires a `receipt:` and a `schedule:`.
+
+| `@budget`
+| module or NIF
+| `NifDecl.boundUs` / `Budget` term
+| A `MaxPlus` bound in microseconds for each NIF or pure function.
+
+| `@trusted`
+| module or function
+| `Assumption`
+| An explicit escape hatch. It requires a receipt and is forbidden under
+  `mix verify --strict`.
+|===
+
+=== A complete Face example
+
+[source,elixir]
+----
+defmodule Verisim.Entity do
+  use GenServer
+  use Quintessence.Face, layer: :b
+
+  @max_payload 1_048_576
+  @max_drift_bp 2_500
+
+  @cap [
+    read: [:entity],
+    write: [:entity],
+    call: [{Verisim.Nif, [hash: 2, drift: 2]}]
+  ]
+
+  @secret [payload: :confidential, digest: :public, drift: :public]
+  @declassify digest: :public, reason: :commitment
+
+  @invariant spec(new_state.version >= old.version)
+
+  @budget hash: 180, drift: 240
+
+  @choreography [
+    roles: [:client, :entity, :auditor],
+    messages: [
+      {:client, :entity, :commit, [:payload]},
+      {:entity, :client, :committed, [:version, :digest]},
+      {:entity, :auditor, :attest, [:version, :digest]}
+    ],
+    knowledge: [
+      {:client, :entity, :committed, [:version, :digest], {:call, :commit}},
+      {:auditor, :entity, :attest, [:version, :digest], {:cast, :attest}}
+    ],
+    forbid: [
+      {:entity, :knows, {:auditor, :received, :attest}, :cast}
+    ]
+  ]
+
+  @impl true
+  @role :entity
+  @handles {:call, :commit}
+  @pre spec(byte_size(payload) <= @max_payload)
+  @pre spec(state.status == :active)
+  @post spec(
+    case result do
+      {:ok, _, _} ->
+        new_state.version == old.version + 1 and
+          new_state.digest == Verisim.Spec.digest_of(payload) and
+          new_state.drift <= @max_drift_bp
+      {:error, _} ->
+        new_state == old
+    end
+  )
+  def handle_call({:commit, payload}, _from, state) do
+    case Verisim.Nif.hash(payload, state.version) do
+      {:ok, digest} ->
+        drift = Verisim.Nif.drift(state.digest, digest)
+
+        if drift <= @max_drift_bp do
+          new_state = %{state | version: state.version + 1, digest: digest, drift: drift}
+          {:reply, {:ok, new_state.version, new_state.digest}, new_state}
+        else
+          {:reply, {:error, :drift}, state}
+        end
+
+      {:error, reason} ->
+        {:reply, {:error, reason}, state}
+    end
+  end
+end
+----
+
+`spec/1` is a quintessence macro that returns the quoted AST without evaluating
+it:
+
+[source,elixir]
+----
+defmacro spec(ast), do: Macro.escape(ast)
+----
+
+The Face registers `@pre`, `@post`, `@invariant`, and `@measure` as accumulating
+attributes and uses `@on_definition` to attach them to the next `def`. The hook
+reads the attributes, emits a `Contract` record into the module's
+`@quintessence_contracts` accumulator, and deletes the per-function attributes so
+they cannot leak into the next definition. `@before_compile` emits the final
+`__quintessence__/0` function returning the module's IR fragment. This is the
+only generated code; it is pure data and does not run at runtime.
+
+=== How `@choreography` elaborates
+
+The keyword list is checked structurally:
+
+. Every role in `messages`, `knowledge`, and `forbid` MUST be declared in
+  `roles`.
+. Every `messages` entry MUST be `{from, to, label, payload_vars}` with distinct
+  `from` and `to`.
+. Every `knowledge` entry MUST name a declared message and a channel:
+  `{:call, label}` for a request/reply, `{:cast, label}` for a one-way send.
+. A `{:call, label}` knowledge claim MUST have a matching reply message from the
+  agent to the knower. This is the K-CUT-WARRANT side condition.
+. A `{:cast, label}` knowledge claim is allowed only for the *receiver* of the
+  message (the receiver knows it was delivered). It is never allowed for the
+  sender (the sender does not know receipt). A sender-side cast claim is
+  `Q-401`.
+. A `forbid` entry is a negative obligation. If the elaborator can derive the
+  forbidden claim from the `knowledge` entries, the module is rejected with the
+  derivation and the falsifier reference (`Y-6` in `choreographic-types`).
+
+The knowledge facts are deliberately *protocol-level*: "the entity committed
+version v", "the auditor received attestation v". Data-level facts ("the digest
+equals BLAKE3(payload)") belong in `@post`, where Layer A and Layer C prove them.
+Mixing the two is the most common way to overclaim: the choreography library's
+Kripke frame carries only what the type determines, and data-dependent warrants
+are explicitly outside its proved fragment.
+
+=== Errors
+
+The Face fails at compile time with a source location, the attribute, and a
+code. The important ones are:
+
+[cols="1,3",options="header"]
+|===
+| Code | Meaning
+
+| `Q-201` | Construct outside the Layer A subset.
+| `Q-202` | Non-exhaustive match or missing catch-all in a protocol handler.
+| `Q-203` | Contract attribute is not a literal or a `spec(...)` expression.
+| `Q-204` | Secret-to-public flow without `@declassify`.
+| `Q-205` | `@cap` names a capability outside the module's declared footprint.
+| `Q-206` | `@measure` is not `nat`-valued or does not decrease.
+| `Q-207` | A construct has no projection into the target theory (Why3, TLA+,
+  or ZigProve), so no obligation can be stated for it.
+| `Q-401` | Unwarranted remote claim: cast/send used as a causal reply.
+| `Q-402` | Choreography is outside the proved K-CUT fragment (recursion, full
+  merge, n-ary choice, dynamic roles).
+| `Q-403` | Protocol handler does not match the declared message shape.
+| `Q-404` | Mailbox occupancy bound not proved and no backpressure declared.
+|===
+
+The Face is not a general-purpose specification language. It is a small,
+reviewable surface whose entire meaning is defined by the IR and the three
+backends. If a claim cannot be expressed in the IR, it cannot be expressed in
+the Face.
+
+[[layer-b]]
+== Layer B: OTP, mailboxes, crashes, and K-CUT
+
+A `GenServer` is a protocol endpoint. Its callbacks define a local type; its
+messages define the interactions; its mailbox is a queue with a high-water mark;
+its supervisor defines what happens when a cut is truncated by a crash. None of
+this is visible to Dialyzer or the type system.
+
+Layer B maps the OTP fragment onto the graded choreographic types of
+`choreographic-types`, checks the K-CUT obligations, and discharges the concrete
+protocol with Apalache. The full rules are in
+link:QUINTESSENCE-LAYER-B.adoc[Layer B]; this section states the model and the
+boundaries.
+
+=== The GenServer-to-protocol mapping
+
+[cols="2,3,3",options="header"]
+|===
+| Elixir | Protocol event | Knowledge after the event
+
+| `GenServer.call(server, msg, timeout)`
+| `Call(client, server, label, payload)`, followed by a reply
+| On `{:ok, reply}`: the caller knows it received a reply. If the reply carries a
+  warrant, it knows the server committed the stated state. On timeout: no
+  knowledge; at most eventual delivery under fairness.
+
+| `GenServer.cast(server, msg)`
+| `Cast(client, server, label, payload)`
+| The caller knows it *sent*. It does not know the server received, handled, or
+  committed anything. No remote state claim is derivable.
+
+| `send(pid, msg)`
+| `Send(sender, receiver, label, payload)`
+| Same as cast: send is not receipt.
+
+| `handle_call(msg, from, state)` returning `{:reply, r, s}`
+| Commit `s`, then reply `r`
+| The server knows it committed `s`; the caller knows it received `r` once the
+  reply is delivered. The reply is the warrant.
+
+| `handle_cast(msg, state)` returning `{:noreply, s}`
+| Commit `s`, no reply
+| The server knows it committed `s`. The caller knows nothing.
+
+| `handle_info(msg, state)`
+| Receive an asynchronous message
+| Whatever the message's warrant supports; an arbitrary `handle_info` cannot
+  create knowledge.
+
+| `monitor(pid)` / `:DOWN`
+| Termination notification
+| The monitor knows the target terminated with the given reason. It does not
+  know the target's state at termination.
+
+| `link(pid)` / exit signal
+| Failure propagation
+| The linked process observes the exit if it traps or survives; the ordering
+  with in-flight messages is not a state commitment.
+
+| Supervisor restart
+| Cut truncation and a new epoch
+| State and mailbox are reset. Knowledge about the old incarnation does not
+  transfer unless a durable receipt carries it.
+|===
+
+=== K-CUT in one page
+
+A *cut* is a consistent frontier across the causal order of a protocol: every
+event before the frontier has happened; every event after it has not. Each party
+has a *view*: its local timeline up to the cut. Two worlds are indistinguishable
+to a party when their views coincide. Knowledge is truth at every world the party
+considers possible:
+
+[source,text]
+----
+K_i(phi) at cut k  iff  phi holds at every world k' with view_i(k') = view_i(k)
+----
+
+`choreographic-types` proves two families for the finite, binary-choice,
+plain-merge fragment, synchronous and asynchronous:
+
+* *K-CUT-LOSS* (`KCut.kcut-loss`, asynchronous `Async.akcut-loss`): grading
+  commutes with endpoint projection across a consistent cut. In English: the
+  global grade restricted to a party equals the grade the party can read from its
+  own view. This is an equality, parametric in the resource algebra, and is
+  discharged at the `Loss`, `MaxPlus`, and `HWM` instances.
+* *K-CUT-WARRANT* (`Bound.knows-lower-bound`, `knows-upper-bound`,
+  `Transport.knows-local-cut`): a party knows its own restricted grade and a
+  one-sided bound on the global grade; knowledge is monotone along the party
+  access preorder. It is a *bound*, not an equality, and the direction depends on
+  where the algebra's unit sits in its order.
+
+The pre-registered falsifier is confirmed:
+`AsyncKnowledge.sender-cannot-know-receipt` proves that, after an asynchronous
+send, the sender does not know the receiver received it. The dual
+`AsyncKnowledge.receiver-knows-sent` proves the receiver does know it was sent.
+A reply restores the sender's knowledge, but only for the two-message protocol
+`0 -> 1 : a . 1 -> 0 : b` (`Instances.reply-gives-knowledge`). The general reply
+chain, position-indexed form, recursion, and full merge are *open*.
+
+This is the single most important boundary in the design. Quintessence MUST NOT
+claim more than the library proves:
+
+[cols="3,3,2",options="header"]
+|===
+| Claim | Status in `choreographic-types` | Quintessence may
+
+| After `call` and its reply, the caller knows the server received the request.
+| Proved for the two-message protocol (`Y-8`).
+| Emit a K-CUT-WARRANT obligation and accept a `call`-based claim.
+
+| After `cast`, the sender knows the receiver received it.
+| Refuted (`Y-6`).
+| Reject with `Q-401`; no escape hatch in `--strict`.
+
+| After a three-message chain, the first sender knows the third party received.
+| Open (general reply chain).
+| Not claim; require a direct reply or mark the claim `assumed`.
+
+| The caller knows the *payload digest* the server computed.
+| Data-dependent warrants are outside the frame.
+| Prove the digest functionally in Layer A/C; do not call it K-CUT knowledge.
+
+| A recursive protocol's knowledge invariant.
+| Recursion is outside the fragment.
+| Reject (`Q-402`) or model a bounded unrolling and label it `BOUNDED`.
+|===
+
+=== Mailbox occupancy
+
+A mailbox is not a channel in the session-type sense, but it has the same
+resource shape: a bounded queue whose high-water mark is a grade. The design uses
+two separate grades and refuses to identify them:
+
+* `HWM` is an occupancy grade: how many messages are live at a cut. Its monoid is
+  not max-plus; `occupancy-types` says so explicitly, and
+  `choreographic-types` proves K-CUT-LOSS at the `HWM` instance.
+* `MaxPlus` is a cost grade: how long a handler or NIF takes. It is the
+  `tropical-types` algebra (Lean) and the `choreographic-types` `MaxPlus`
+  instance (Agda). They are the same algebra in name and laws, but the Lean-to-Agda
+  bridge is open; the two discharges are separate evidence, not one.
+
+The mailbox obligation is:
+
+[source,text]
+----
+len(mailbox(pid)) <= HWM(pid)        for every reachable state
+HWM(pid) <= Cap(pid)                 for every declared capacity
+----
+
+`HWM` is derived from the protocol's occupancy grade at the cut, plus the
+operational queue discipline. The elaborator emits:
+
+. A K-CUT-LOSS instance for the `HWM` algebra, so the global protocol's occupancy
+  bound projects to each role.
+. A per-process queue model: arrival curve `alpha`, service curve `beta`, and the
+  backlog bound `sup_t (alpha(t) - beta(t))`. For a simple rate/burst model this
+  is `B + lambda * W`, where `W` is the worst-case handler latency from Layer C's
+  `MaxPlus` bound.
+. A selective-receive check. `receive` scans the mailbox in order; unmatched
+  messages stay. For each pattern class, the checker computes the effective
+  service rate and proves no class starves. A handler with a catch-all `receive`
+  that never matches a class is a starvation bug, not a bound.
+. A backpressure obligation. If the bound cannot be proved, the spec MUST use a
+  bounded internal queue with `handle_continue` or a `call`-based handshake; an
+  unbounded mailbox is `Q-404`.
+
+The MVP's mailbox model is single-node, crash-stop, and fair. Distributed
+mailboxes, `noconnection`, and partitions are Phase 4; the K-CUT-LOSS layer
+already models messages in flight, so the semantics are there, but the OTP
+mapping is not.
+
+=== Crashes, links, and supervision
+
+A crash truncates the cut. Messages in flight to the crashed process are lost;
+messages it had sent are still in other mailboxes; its state is gone. This is
+exactly the loss/reorder model of the asynchronous K-CUT layer, with one
+additional event: a new incarnation with a fresh epoch.
+
+* `monitor`/`:DOWN` gives the monitor knowledge of termination, not of state.
+* `link` propagates exits; a trapping process receives `{:EXIT, pid, reason}`,
+  which is a signal, not a state commitment.
+* `one_for_one` restarts one child; the rest of the system sees a new pid/epoch.
+  Any invariant that mentions the child's state must be re-established by
+  `init/1`, or carried by a durable receipt.
+* `rest_for_one` and `one_for_all` restart a suffix/all of the tree; the cut is
+  global. The proof must show the invariant is inductive over the restart, not
+  just over normal transitions.
+* `max_restarts`/`max_seconds` escalation terminates the subtree. The spec MUST
+  state whether that is a permitted outcome; it is not silently ignored.
+
+The Face's `@invariant` is checked at `init/1` (establishment) and at every
+handler (preservation). A restart re-runs the establishment obligation. If the
+invariant depends on state that is not rebuilt, the obligation fails; this is the
+desired behaviour.
+
+=== Apalache
+
+The concrete protocol is emitted as a TLA+ module and checked by Apalache for a
+bounded instance. The encoding is deliberately small:
+
+[source,tlaplus]
+----
+VARIABLES state, mailbox, inflight, view, epoch, committed
+
+Init ==
+    /\ state = [r \in Roles |-> InitState(r)]
+    /\ mailbox = [r \in Roles |-> <<>>]
+    /\ inflight = {}
+    /\ view = [r \in Roles |-> <<>>]
+    /\ epoch = [r \in Roles |-> 0]
+    /\ committed = [r \in Roles |-> {}]
+
+Send(i, j, msg) ==
+    /\ i # j
+    /\ Len(mailbox[j]) < MaxMailbox
+    /\ mailbox' = [mailbox EXCEPT ![j] = Append(@, msg)]
+    /\ inflight' = inflight \cup {<<i, j, msg>>}
+    /\ UNCHANGED <<state, view, epoch, committed>>
+
+Deliver(j, msg) ==
+    /\ msg \in inflight
+    /\ mailbox' = [mailbox EXCEPT ![j] = Tail(@)]
+    /\ view' = [view EXCEPT ![j] = Append(@, msg)]
+    /\ inflight' = inflight \ {msg}
+    /\ UNCHANGED <<state, epoch, committed>>
+
+Commit(j, v) ==
+    /\ state' = [state EXCEPT ![j] = NextState(@, v)]
+    /\ committed' = [committed EXCEPT ![j] = @ \cup {v}]
+    /\ UNCHANGED <<mailbox, inflight, view, epoch>>
+
+NoUnwarrantedRemoteClaim ==
+    \A r \in Roles, f \in committed[r] :
+        f \in committed[r] => HasWarrant(r, f)
+----
+
+Apalache checks `TypeOK`, `MailboxBound`, `NoUnwarrantedRemoteClaim`, and the
+protocol's state invariant for a fixed `MaxMailbox`, `MaxEpochs`, and message
+bound. The result is labelled `BOUNDED`. It is a bug finder and a consistency
+check on the encoding, not a proof for all executions. The unbounded argument is
+the K-CUT typing derivation plus the occupancy bound; Apalache checks that the
+concrete protocol does not have a short counterexample the abstraction missed.
+
+=== What Layer B proves
+
+The composition theorem is the target, not a theorem of the current MVP:
+
+[source,text]
+----
+If
+  (1) every Layer A handler satisfies its contract,
+  (2) the protocol is well-typed in the proved K-CUT fragment and every
+      knowledge claim has a warrant,
+  (3) the mailbox occupancy bound is proved (or backpressure is present),
+  (4) every NIF receipt is valid and its MaxPlus bound is within budget,
+then
+  no reachable state violates the module invariant, and
+  no actor makes an unwarranted remote claim.
+----
+
+The proof is an induction over cuts: Layer A gives each local transition; K-CUT
+gives projection and knowledge; the occupancy bound gives queue safety; Layer C
+gives the native refinement. The induction is *not* machine-checked as a whole in
+the MVP; the K-CUT metatheory is, and the concrete protocol is model-checked.
+Closing the composition theorem in Agda is a Phase 5 work package. Until then,
+the receipt records `composition: assumed` and `apalache: bounded`.
+
+[[layer-c]]
+== Layer C: the verified Elixir-Idris2-Zig boundary
+
+A NIF is the one place where an Elixir program can corrupt the runtime. The
+boundary has three languages and two ABIs:
+
+[source,text]
+----
+Elixir stub  --(Erlang NIF ABI)-->  Rustler glue  --(C ABI)-->  Zig core
+     |                                    |                         |
+     |  @nif receipt check at load         |  ResourceArc, terms     |  ZigProve
+     |  schedule from receipt              |  no term escape         |  MaxPlus bound
+----
+
+The supported shape for the MVP is the Rustler wrapper around a Zig static
+library. Rustler owns term decoding/encoding and `ResourceArc`; Zig owns the
+algorithm and its memory. A pure Zig NIF using `erl_nif.h` directly is a Phase 4
+option for zero-copy performance, with a larger obligation set (term lifetimes,
+environment handling, dirty flags) and therefore a larger TCB.
+
+=== Idris2 QTT ABI
+
+The Idris2 module is the specification the Elixir stub imports. It is linear in
+the resource, total in the wrapper, and explicit about the `%foreign` boundary.
+
+[source,idris2]
+----
+module Verisim.Abi
+
+import Data.Bits
+import Data.So
+import Data.Vect
+
+%default total
+
+public export
+data HandleState = Open | Closed
+
+public export
+data Handle : HandleState -> Type where
+  MkHandle : (ptr : Bits64) -> (0 nonNull : So (ptr /= 0)) -> Handle Open
+
+public export
+data Buffer = MkBuffer (ptr : Bits64) (len : Bits32) (0 nonEmpty : So (len /= 0))
+
+public export
+data Resource : Type where
+  MkResource : Handle Open -> Resource
+
+public export
+data Digest = MkDigest (Vect 32 Bits8)
+
+public export
+data Drift = MkDrift (Fin 10001)          -- basis points, 0..10000
+
+%foreign "C:verisim_hash,libverisim_nif"
+prim__hash : Bits64 -> Bits64 -> Bits32 -> Bits32 -> PrimIO Bits64
+
+%foreign "C:verisim_drift,libverisim_nif"
+prim__drift : Bits64 -> Bits64 -> Bits64 -> PrimIO Bits32
+
+public export
+hash : (1 r : Resource) -> (payload : Buffer) -> (seed : Bits32)
+    -> IO (Either String (Digest, Resource))
+hash (MkResource (MkHandle ptr _)) (MkBuffer p len _) seed = do
+  out <- primIO (prim__hash ptr p len seed)
+  if out == 0
+    then pure (Left "hash failed")
+    else pure (Right (MkDigest (fromBitsLE out), MkResource (MkHandle ptr Oh)))
+
+public export
+drift : (1 r : Resource) -> (a : Digest) -> (b : Digest)
+     -> IO (Either String (Drift, Resource))
+drift r a b = do
+  out <- primIO (prim__drift (ptrOf r) (bitsOf a) (bitsOf b))
+  if out > 10000
+    then pure (Left "drift out of range")
+    else pure (Right (MkDrift (fromNat out), r))
+----
+
+The `1` multiplicity says the resource is consumed exactly once; the wrapper
+returns it, so the caller's linear obligation continues. The `0` on `nonNull`
+says the proof is erased. The `Either String` return models every native error as
+data; there is no `raise` across the ABI.
+
+The linearity gap is real and must be stated: the BEAM's `ResourceArc` is
+reference-counted and shared, not linear. Rustler prevents use-after-free by
+refcounting; it does not prevent two Elixir processes from holding the same
+`ResourceArc`. Quintessence enforces single-owner discipline in the Elixir stub
+(a handle table with generation counters and an ownership token) and checks the
+stub's API against the Idris2 linear type. The receipt records
+`linearity: stub-enforced`, not `linearity: kernel-proved`.
+
+=== The ZigProve receipt
+
+A receipt is the native layer's evidence object. It is content-addressed,
+target-specific, and checked at load time.
+
+[source,json]
+----
+{
+  "schema": "quintessence.nif.receipt/v1",
+  "subject": {
+    "name": "verisim_nif",
+    "abi_module": "Verisim.Abi",
+    "source_sha256": "b1e4...",
+    "binary_sha256": "9f2c...",
+    "target": "x86_64-unknown-linux-gnu",
+    "zig_version": "0.15.2",
+    "rustler_version": "0.36.1"
+  },
+  "obligations": [
+    {"id": "C1.no-null-deref", "status": "proved", "checker": "zigprove", "proof_sha256": "aa01..."},
+    {"id": "C2.in-bounds", "status": "proved", "checker": "zigprove", "proof_sha256": "aa02..."},
+    {"id": "C3.alignment", "status": "proved", "checker": "zigprove", "proof_sha256": "aa03..."},
+    {"id": "C4.initialized", "status": "proved", "checker": "zigprove", "proof_sha256": "aa04..."},
+    {"id": "C5.no-alias", "status": "proved", "checker": "zigprove", "proof_sha256": "aa05..."},
+    {"id": "C6.no-overflow", "status": "proved", "checker": "zigprove", "proof_sha256": "aa06..."},
+    {"id": "C7.alloc-free", "status": "proved", "checker": "zigprove", "proof_sha256": "aa07..."},
+    {"id": "C8.no-unwind", "status": "proved", "checker": "zigprove", "proof_sha256": "aa08..."},
+    {"id": "C9.no-term-escape", "status": "proved", "checker": "rustler", "proof_sha256": "aa09..."},
+    {"id": "C10.thread-safe", "status": "proved", "checker": "zigprove", "proof_sha256": "aa10..."},
+    {"id": "C11.destructor-once", "status": "proved", "checker": "rustler", "proof_sha256": "aa11..."},
+    {"id": "C12.allocator-match", "status": "proved", "checker": "zigprove", "proof_sha256": "aa12..."}
+  ],
+  "budget": {
+    "model": "maxplus/v1",
+    "expr": "max(180, 240)",
+    "bound_us": 240,
+    "threshold_us": 1000,
+    "schedule": "normal"
+  },
+  "warrant": {
+    "id": "w-2026-10-22-0001",
+    "trust_level": 4,
+    "status": "complete",
+    "route": ["zigprove", "lean4"]
+  }
+}
+----
+
+The stub checks `binary_sha256` against the loaded `.so`, `schema` against the
+expected version, every obligation against `proved`, and `schedule` against the
+declared `@nif` schedule. A mismatch is a load failure, not a warning.
+
+=== Heap-corruption obligations
+
+[cols="1,3,2",options="header"]
+|===
+| ID | Obligation | Discharged by
+
+| C1 | No null or dangling pointer is dereferenced. | ZigProve (pointer provenance, non-null types)
+| C2 | Every slice access is in bounds. | ZigProve (bounds proofs on `[]u8`)
+| C3 | Every typed load/store is aligned. | ZigProve + Idris2 layout proof
+| C4 | No uninitialized memory is read. | ZigProve (definite assignment)
+| C5 | No aliasing violation (mutable alias, overlapping copy). | ZigProve (borrow discipline)
+| C6 | No unchecked integer overflow in release-safe mode. | ZigProve (range analysis)
+| C7 | Every allocation is freed exactly once; no double free. | ZigProve (ownership)
+| C8 | No panic/unwind crosses the C ABI. | ZigProve + `catch` at the boundary
+| C9 | No `Term`, `Env`, or binary term outlives the NIF call. | Rustler type system + code review
+| C10 | Shared state is synchronized; dirty schedulers may run concurrently. | ZigProve (lock discipline) + Rustler `Mutex`
+| C11 | `ResourceArc` destructor runs exactly once; no use-after-free. | Rustler refcount
+| C12 | Allocator used for allocation is used for deallocation. | ZigProve (allocator threading)
+|===
+
+`ZigProve` is an estate tool; this document treats its receipt interface as an
+external contract. If the pinned revision exposes different obligation names, the
+adapter maps them; the semantic coverage check (all twelve IDs present, all
+`proved`) is quintessence's, not the tool's. If a NIF uses `@cImport`, inline
+assembly, a custom allocator, or a global mutable variable, the obligation set is
+not the one above; it is `Q-301` until a dedicated receipt schema exists.
+
+=== MaxPlus and the scheduler
+
+The cost algebra is the tropical one from `tropical-types`:
+
+[source,text]
+----
+Carrier:  Tropical = bot | val Nat
+add (choice):      max
+mul (sequence):    +
+zero:              bot        (identity of max)
+one:               val 0      (identity of +)
+order:             bot <= val n <= val m  iff  n <= m
+----
+
+A NIF's cost expression is built compositionally: sequence is `+`, branch is
+`max`, a loop with a proved bound `n` is `n * body`, and an unbounded loop is
+`Unknown`, which is rejected. The checker compares the result with the budget:
+
+[source,text]
+----
+c <= budget_us        and   c <= threshold_us  ->  schedule = normal
+c <= budget_us        and   c >  threshold_us  ->  schedule = dirty_cpu
+c >  budget_us        or    c = Unknown        ->  reject (Q-302)
+----
+
+The default `threshold_us` is 1000, matching ERTS's documented guidance that a
+NIF which cannot execute in about a millisecond should be a dirty NIF. The margin
+is configurable but MUST be justified in the receipt; a bound of 999 us is not a
+proof that the scheduler is safe, only that the model says so.
+
+The scheduler liveness argument is intentionally modest:
+
+[source,text]
+----
+If every normal NIF has c <= T, and a scheduler thread runs at most one NIF at a
+time, then a runnable process waits at most T plus the ordinary reduction slice
+before it is scheduled. Dirty NIFs run on a separate pool; their concurrency must
+be bounded by D = dirty_cpu_schedulers, or the pool itself becomes the queue.
+----
+
+This is not a proof of the BEAM scheduler. It is a bound on the NIF's
+contribution, under the documented ERTS model. The receipt records the model and
+the threshold; the trust ledger records the assumption.
+
+=== The Elixir stub
+
+[source,elixir]
+----
+defmodule Verisim.Nif do
+  use Quintessence.Nif,
+    otp_app: :verisim,
+    library: "verisim_nif",
+    abi: Verisim.Abi,
+    receipt: "priv/receipts/verisim_nif.receipt.json"
+
+  @nif :hash, schedule: :auto, budget_us: 180
+  def hash(payload, seed), do: :erlang.nif_error(:nif_not_loaded)
+
+  @nif :drift, schedule: :auto, budget_us: 240
+  def drift(a, b), do: :erlang.nif_error(:nif_not_loaded)
+end
+----
+
+`schedule: :auto` is not a runtime switch. It means *take the schedule compiled
+into the `.so` and require the receipt to agree with it*. The stub never promotes
+a NIF to a dirty scheduler; the decision is made at build time and recorded in
+the receipt, and a disagreement is `Q-305`.
+
+`use Quintessence.Nif` generates `@on_load :__quintessence_load__/0`, which:
+
+. Reads the receipt from `priv/receipts`.
+. Hashes the candidate `.so` and compares `binary_sha256`.
+. Checks the target triple and the ABI module hash.
+. Checks that every obligation is `proved` and every budget is within threshold.
+. Reads the receipt's `schedule`; if it is `dirty_cpu`, the generated
+   `:erlang.load_nif` call is the same (the flag is compiled into the `.so`), but
+   the stub records the required flag and `mix verify` checks that the Rustler
+   `#[nif(schedule = "DirtyCpu")]` annotation matches. A mismatch is `Q-305`.
+. Loads the library. On any failure, returns `{:error, reason}` from `@on_load`,
+   which prevents the module from loading.
+
+The stub contains no business logic. All Term decoding is Rustler's; all
+algorithmic state is in the resource; all error paths are data.
+
+[[evidence]]
+== Evidence: ECHIDNA, Warrants, Receipts, and vacuity
+
+A verification run that prints "proved" is not evidence. Quintessence has exactly
+two evidence objects, and their difference is the difference between a local
+solver run and a kernel-checked result.
+
+=== Warrant
+
+A *Warrant* is a locally produced, content-addressed claim that a specific goal
+was discharged by a specific route. It is `INCOMPLETE` until independent kernels
+check it.
+
+[source,json]
+----
+{
+  "schema": "quintessence.warrant/v1",
+  "id": "sha256:6f1c...",
+  "claim": {
+    "goal": "Verisim.Entity.handle_call/3 post#2",
+    "qir": "sha256:9ab0...",
+    "layer": "A"
+  },
+  "status": "incomplete",
+  "trust_level": 3,
+  "route": [
+    {"prover": "why3", "version": "1.7.2", "result": "unsat"},
+    {"prover": "z3", "version": "4.13.0", "result": "unsat", "certificate": null}
+  ],
+  "assumptions": ["elaborator", "smt-oracle"],
+  "artifacts": [
+    {"kind": "why", "path": "cache/why/Entity_post2.why", "sha256": "c0de..."},
+    {"kind": "dk", "path": "cache/dk/Entity_post2.dk", "sha256": "d00d..."}
+  ],
+  "origin": {"file": "lib/verisim/entity.ex", "line": 61}
+}
+----
+
+`trust_level` is ECHIDNA's existing five-level scale, not a new one:
+
+[cols="1,4,3",options="header"]
+|===
+| Level | ECHIDNA meaning | Quintessence use
+
+| 1 | Minimal: large TCB, unchecked, or dangerous axioms | Never acceptable.
+| 2 | Basic: single prover, no dangerous axioms | Advisory only; cannot ship a NIF or a K-CUT claim.
+| 3 | Moderate: single prover with proof certificate | Local development; Warrant only.
+| 4 | High: small-kernel prover with certificate | Layer A may ship; a Layer B
+  instance may ship with the pinned Agda metatheory; a development NIF may load
+  with a ZigProve receipt and a matching binary hash.
+| 5 | Maximum: cross-checked by two or more small-kernel systems | Required for
+  `@trusted`, release NIFs, the Layer A/C release gate, and a Layer B instance
+  that is cross-checked in Coq and Lean.
+|===
+
+The configured `receipt_policy` chooses the gate: the default demands Level 5 for
+Layer B and Layer C at release, while a development run may lower it explicitly
+and the Receipt records the level it actually reached.
+
+=== Receipt
+
+A *Receipt* is issued only when the batch stage has independently checked the
+Warrant's obligations in Coq and Lean, both returned `QED`, and the axiom tracker
+found no forbidden axiom.
+
+[source,json]
+----
+{
+  "schema": "quintessence.receipt/v1",
+  "warrant": "sha256:6f1c...",
+  "checks": [
+    {"kernel": "coq", "version": "8.20.1", "proof_sha256": "a1...", "status": "QED"},
+    {"kernel": "lean4", "version": "4.13.0", "proof_sha256": "b2...", "status": "QED"}
+  ],
+  "axioms": [],
+  "status": "complete",
+  "trust_level": 5,
+  "issuer": "echidna",
+  "issued_at": "2026-10-22T14:05:00Z",
+  "signature": "ed25519:..."
+}
+----
+
+The batch stage has two modes:
+
+* `reprove` (default): Coq and Lean independently prove the *same statement*
+  from the IR. This matches ECHIDNA's Level 5 definition (two small kernels
+  agree) without trusting a proof translation.
+* `transport` (Phase 5): translate the Dedukti `.dk` witness into Coq and Lean
+  and check the translated proof. Stronger connection to the local witness, but
+  the translators are TCB. Until they are proved, `transport` receipts are
+  labelled `translation: assumed`.
+
+=== The route from Why3 to Dedukti
+
+Why3 does not emit Dedukti natively. The pipeline is explicit about the gap:
+
+. Why3 generates VCs and splits them. The SMT portfolio returns `unsat`.
+. For the *decidable fragment* (quantifier-free linear arithmetic, equality,
+   uninterpreted functions, algebraic data types, arrays), `why3-dk` reconstructs
+   a `.dk` proof term. The reconstruction is a named TCB component.
+. `dkcheck` checks the `.dk` term. Success gives a local Warrant with
+   `route: [why3, dkcheck]`, `trust_level: 4`, `status: incomplete`.
+. For obligations outside the fragment, the status is `UNCHECKED`, not "proved by
+   SMT". An `UNCHECKED` obligation cannot enter a Receipt and cannot satisfy a
+   NIF or K-CUT gate.
+. The batch stage re-proves the statement in Coq and Lean. Two QEDs promote the
+   Warrant to a Receipt at Level 5.
+
+The honest consequence: an SMT `unsat` with no certificate is *not* verification
+evidence in quintessence. It is a strong hint. The MVP may run in
+`--allow-oracle` mode for ordinary Layer A, but that mode stamps every affected
+goal `oracle: true` and cannot produce a Receipt.
+
+=== Vacuity and mutation
+
+A proof of a vacuous specification is worthless. Quintessence checks vacuity in
+four independent ways.
+
+[cols="1,2,3",options="header"]
+|===
+| Probe | Question | Failure
+
+| V1: antecedent satisfiability
+| Is there any input that satisfies `@pre`? SMT is asked for a model of the
+  conjunction of preconditions.
+| `Q-601 VACUOUS`: the precondition is unsatisfiable.
+
+| V2: postcondition non-triviality
+| Is the postcondition true for every result, independently of the body? The
+  checker tries to prove `post` with the body replaced by an uninterpreted
+  function.
+| `Q-602 TRIVIAL`: the postcondition does not constrain the implementation.
+
+| V3: mutation score
+| Do weakened versions of the specification fail to verify?
+| `Q-603 WEAK_SPEC`: the score is below the threshold (default 95%).
+
+| V4: protocol reachability
+| Does the choreography have a reachable state satisfying its goal? Apalache is
+  asked for a witness.
+| `Q-604 VACUOUS_PROTOCOL`: no reachable state; the protocol proves nothing.
+|===
+
+The mutation engine is ECHIDNA's `verification::mutation` module. Its public
+surface is `MutationTester`, `MutationKind`, `MutationResult`,
+`MutationTestSummary`, and `meets_target(threshold)`; the default target is 95%.
+The six built-in kinds are `RemovePrecondition`, `WeakenPostcondition`,
+`AddDisjunct`, `RemoveHypothesis`, `ReplaceConstant`, and `NegateSubterm`.
+Quintessence maps its IR goals onto `echidna::core::Term` and adds a
+layer-specific plan:
+
+[cols="2,3,3",options="header"]
+|===
+| Layer | Additional mutants | Why
+
+| A
+| Swap `and`/`or`; drop a match arm; off-by-one on a numeric literal; replace
+  `==` with `!=`; replace `:ok` with `:error`; drop a `@declassify`.
+| These are the defects a functional postcondition should catch.
+
+| B
+| Replace `call` with `cast`; drop a reply; reorder independent messages; delay a
+  reply past a timeout; restart a process at a cut.
+| These are the protocol defects K-CUT and Apalache should catch.
+
+| C
+| Widen a `MaxPlus` bound; change `dirty_cpu` to `normal`; drop a receipt
+  obligation; swap a `u32` for a `u64`; remove a bounds check.
+| These are the boundary defects the receipt should catch.
+|===
+
+The score is computed over *proof-relevant* obligations only. A `@pre` that the
+proof never uses is a runtime guard, not an assumption; removing it cannot make
+the proof fail. Such a precondition is marked `guard: true` and is validated by
+tests, not counted as a mutation survivor. Without this distinction, the metric
+rewards adding irrelevant preconditions.
+
+A worked failure: the postcondition `result.digest != the empty binary` is
+weaker than `result.digest == digest_of(payload)`. The mutant that replaces the
+latter with the former survives, because every non-empty digest satisfies the
+weak version.
+
+The score drops below 95%, the report names the surviving mutant and the
+postcondition it weakened, and the author strengthens the postcondition. That is
+the intended loop.
+
+[[worked-example]]
+== Worked dual example: a VeriSimDB entity
+
+The example is in link:../../examples/quintessence/README.adoc[`examples/quintessence/`].
+It is a single GenServer, a single NIF, and a single three-role protocol, chosen
+to exercise all three layers without hiding behind a framework.
+
+=== The entity
+
+[source,elixir]
+----
+defmodule Verisim.Entity do
+  use GenServer
+  use Quintessence.Face, layer: :b
+
+  @max_payload 1_048_576
+  @max_drift_bp 2_500
+
+  @cap [read: [:entity], write: [:entity],
+        call: [{Verisim.Nif, [hash: 2, drift: 2]}]]
+  @secret [payload: :confidential, digest: :public, drift: :public]
+  @declassify digest: :public, reason: :commitment
+  @invariant spec(new_state.version >= old.version)
+  @budget hash: 180, drift: 240
+
+  @choreography [
+    roles: [:client, :entity, :auditor],
+    messages: [
+      {:client, :entity, :commit, [:payload]},
+      {:entity, :client, :committed, [:version, :digest]},
+      {:entity, :auditor, :attest, [:version, :digest]}
+    ],
+    knowledge: [
+      {:client, :entity, :committed, [:version, :digest], {:call, :commit}},
+      {:auditor, :entity, :attest, [:version, :digest], {:cast, :attest}}
+    ],
+    forbid: [
+      {:entity, :knows, {:auditor, :received, :attest}, :cast}
+    ]
+  ]
+
+  @impl true
+  @role :entity
+  @handles {:call, :commit}
+  @pre spec(byte_size(payload) <= @max_payload)
+  @pre spec(state.status == :active)
+  @post spec(
+    case result do
+      {:ok, _, _} ->
+        new_state.version == old.version + 1 and
+          new_state.digest == Verisim.Spec.digest_of(payload) and
+          new_state.drift <= @max_drift_bp
+      {:error, _} ->
+        new_state == old
+    end
+  )
+  def handle_call({:commit, payload}, _from, state) do
+    case Verisim.Nif.hash(payload, state.version) do
+      {:ok, digest} ->
+        drift = Verisim.Nif.drift(state.digest, digest)
+
+        if drift <= @max_drift_bp do
+          new_state = %{state | version: state.version + 1, digest: digest, drift: drift}
+          {:reply, {:ok, new_state.version, new_state.digest}, new_state}
+        else
+          {:reply, {:error, :drift}, state}
+        end
+
+      {:error, reason} ->
+        {:reply, {:error, reason}, state}
+    end
+  end
+
+  @impl true
+  @role :entity
+  @handles {:cast, :attest}
+  @post spec(
+    case result do
+      :ok -> new_state == old
+      _   -> new_state == old
+    end
+  )
+  def handle_cast({:attest, _version, _digest}, state) do
+    # The entity sends an attestation to the auditor. It does not, and must not,
+    # claim the auditor received it: there is no reply in this protocol.
+    {:noreply, state}
+  end
+end
+----
+
+The `handle_cast` has no knowledge claim about the auditor. The `forbid` entry
+makes that explicit: if a future edit adds `{:entity, :knows,
+{:auditor, :received, :attest}, :cast}` to `knowledge`, the elaborator derives the
+forbidden claim and rejects the module with `Q-401`.
+
+=== Obligations
+
+[cols="1,3,4",options="header"]
+|===
+| ID | Obligation | Discharged by
+
+| A1 | `byte_size(payload) <= 1_048_576` is satisfiable (V1). | SMT model
+| A2 | `new_state.version = old.version + 1` on the success path. | Why3 + SMT
+| A3 | `new_state.digest = digest_of(payload)` on the success path. | Why3 + SMT + NIF refinement
+| A4 | `new_state.drift <= 2_500` on the success path. | Why3 + SMT
+| A5 | The error path leaves the state unchanged. | Why3 + SMT
+| A6 | `@invariant` is established by `init/1` and preserved by both handlers. | Why3 + SMT
+| A7 | The digest declassification is the only secret-to-public flow. | `secret-types` instance + TINI
+| B1 | `client` knows `entity` committed `(v, d)` only after the `committed` reply. | K-CUT-WARRANT (`Y-8`, two-message protocol)
+| B2 | `auditor` knows it received `attest(v, d)` (receiver of the first message). | `Y-5` `receiver-knows-sent`
+| B3 | `entity` does not know `auditor` received `attest`. | `Y-6` falsifier; `Q-401` if claimed
+| B4 | The mailbox HWM is bounded by the protocol grade and the service bound. | `HWM` K-CUT-LOSS instance + occupancy check
+| C1-C12 | The NIF's memory obligations. | ZigProve receipt
+| C13 | `hash` and `drift` are `<= 1000 us` and tagged normal. | `MaxPlus` + receipt
+| E1 | The spec is not vacuous and survives mutation. | ECHIDNA `mutation.rs` + V1-V4
+|===
+
+=== What the run looks like
+
+[source,text]
+----
+$ mix verify --module Verisim.Entity --receipt
+==> quintessence 0.1.0 (qir/v1, elixir 1.19.0, OTP 28)
+[g0] firewall: 2 modules, 11 macro calls, allowlist ok, expansion hash 7c3a...
+[g1] subset: 9 functions, 2 handlers, 1 protocol, 0 rejected
+[qir] sha256:9ab0...
+[layer a] Verisim.Entity.handle_call/3: 9 VCs -> 9 proved (why3 1.7.2)
+          Verisim.Spec.check_drift/1: 2 VCs -> 2 proved
+          Verisim.Spec.digest_of/1: model (no body)
+[layer b] protocol Verisim.Entity: 3 roles, 3 messages, 2 knowledge claims
+          B1 client<-entity: call/commit + reply/committed -> K-CUT-WARRANT OK
+          B2 auditor<-entity: cast/attest -> receiver-knows-sent OK
+          B3 entity->auditor: no claim; forbid check OK
+          B4 mailbox HWM: 64 <= 128 (bound 128)
+[layer c] Verisim.Nif.hash/2: receipt sha256:9f2c..., MaxPlus 180us <= 1000us -> normal
+          Verisim.Nif.drift/2: receipt sha256:41ab..., MaxPlus 240us <= 1000us -> normal
+[echidna] 23 goals -> 23 warrants; 23 dk checked; batch: 23 Coq QED, 23 Lean QED
+[receipt] sha256:5e11... trust_level 5, status complete
+[mutate] 18 mutants, 18 caught, 0 survived (100%), vacuity V1-V4 clean
+[gate] PASS
+----
+
+The failing variant is more instructive. Suppose the author had written
+`GenServer.cast(entity, {:commit, payload})` and then claimed the entity
+committed it. The run would contain:
+
+[source,text]
+----
+[layer b] B1 client->entity: cast/commit has no causal reply
+          Q-401 UNWARRANTED_REMOTE_CLAIM
+          falsifier: AsyncKnowledge.sender-cannot-know-receipt
+          remedy: use GenServer.call/3 and claim after the reply, or
+                  drop the knowledge claim and keep only the send fact
+[gate] FAIL
+----
+
+The remedy is not a flag. Either the protocol gains a reply (and the claim is
+covered by the two-message theorem), or the claim is removed. There is no
+`--allow-unwarranted` escape hatch; the most one can do is mark the claim
+`assumed` with a receipt, which is visibly not a K-CUT proof.
+
+=== What is assumed in this example
+
+* The NIF receipt is valid for the built `.so` (hash, target, obligations).
+* `Verisim.Spec.digest_of/1` is a faithful model of the hash; the NIF receipt
+  proves the implementation returns it.
+* The client and entity are authenticated; the network is not Byzantine.
+* The two-message reply theorem applies because the `commit`/`committed`
+  exchange is exactly `0 -> 1 : a . 1 -> 0 : b`.
+* The auditor's `attest` is the first message the auditor receives; `Y-5`
+  applies. The entity's ignorance of receipt is `Y-6`.
+* The mailbox bound uses the measured service bound and the configured arrival
+  curve; it is an operational model, not a theorem about the BEAM scheduler.
+
+[[mix-verify]]
+== `mix verify`
+
+`mix verify` is the only entry point. It compiles the project with the firewall
+tracer, elaborates the Face, projects the three layers, dispatches ECHIDNA,
+checks the evidence policy, and exits with a status that CI can trust.
+
+=== Command surface
+
+[cols="2,3",options="header"]
+|===
+| Command | Meaning
+
+| `mix verify`
+| Verify all layers, all modules, with the configured policy. Requires a Receipt
+  for NIFs and K-CUT claims.
+
+| `mix verify --module Verisim.Entity`
+| Restrict to one module (and its dependencies).
+
+| `mix verify --layer a`
+| Run only Layer A. Useful for fast feedback; cannot satisfy a NIF or protocol
+  gate.
+
+| `mix verify --strict`
+| Forbid `@trusted`, `--allow-oracle`, and `assumed` receipts. The default for
+  release branches.
+
+| `mix verify --allow-oracle`
+| Permit SMT-only Layer A results, stamped `oracle: true`. Never permits a
+  Receipt, a NIF, or a K-CUT claim.
+
+| `mix verify --receipt`
+| Write the Receipt(s) to `priv/receipts/` and print the trust level.
+
+| `mix verify --replay`
+| Re-run from the cached `.qir` and Warrant artifacts; fail if the tool pins or
+  hashes differ.
+
+| `mix verify --format json`
+| Machine-readable output (I-JSON, JCS) for CI and dashboards.
+
+| `mix verify --format sarif`
+| SARIF for code scanning; each `Q-*` error becomes a result with a source
+  location.
+
+| `mix quintessence.doctor`
+| Check tool pins, solver binaries, Agda/Idris2/Lean/Coq versions, and the
+  receipt store. Fails closed if a required tool is missing.
+
+| `mix quintessence.explain Q-401`
+| Print the rule, the falsifier, and the remedy for an error code.
+
+| `mix quintessence.receipt show`
+| Print a Receipt and its Warrant chain.
+|===
+
+=== Configuration
+
+[source,elixir]
+----
+# quintessence.exs
+import Config
+
+config :quintessence,
+  layers: [:a, :b, :c],
+  receipt_policy: %{
+    layer_a: :level_4,
+    layer_b: :level_5,
+    layer_c: :level_5,
+    trusted: :level_5
+  },
+  maxplus: %{
+    threshold_us: 1_000,
+    margin_us: 100,
+    dirty_cpu_concurrency: 4
+  },
+  mailbox: %{
+    default_capacity: 128,
+    require_backpressure: true
+  },
+  mutation: %{
+    enabled: true,
+    threshold: 95.0,
+    exclude_guards: true
+  },
+  echidna: %{
+    endpoint: "http://127.0.0.1:8080",
+    batch_kernels: [:coq, :lean4],
+    batch_mode: :reprove,
+    forbidden_axioms: [:propext, :classical_choice, :believe_me]
+  },
+  firewall: %{
+    allowlist: "quintessence.macros",
+    sandbox: :bubblewrap,
+    double_expand: true
+  }
+----
+
+=== Pipeline and exit codes
+
+[cols="1,2,3",options="header"]
+|===
+| Stage | Runs | Failure code
+
+| 0 | `mix quintessence.doctor` | `Q-901` toolchain missing
+| 1 | G0 firewall | `Q-101` to `Q-113`
+| 2 | G1 subset + Face elaboration | `Q-201` to `Q-206`, `Q-401` to `Q-404`
+| 3 | `.qir` emission and hash | `Q-902` serialization
+| 4 | Layer A projection + VCs | `Q-207` unsupported projection
+| 5 | Layer B K-CUT + Apalache | `Q-402`, `Q-404`, `Q-605` bounded counterexample
+| 6 | Layer C receipt + MaxPlus | `Q-301` to `Q-305`
+| 7 | ECHIDNA dispatch + Warrant | `Q-501` prover failure, `Q-502` axiom
+| 8 | Batch Coq + Lean + Receipt | `Q-503` kernel mismatch, `Q-504` incomplete
+| 9 | Mutation + vacuity | `Q-601` to `Q-604`
+| 10 | Gate | `Q-905` policy violation
+|===
+
+Exit codes are stable: `0` verified, `1` verification failure, `2` usage or
+configuration error, `3` required toolchain missing, `4` receipt invalid or
+missing, `5` mutation/vacuity failure. CI must branch on these, not on stdout.
+
+=== Implementation sketch
+
+[source,elixir]
+----
+defmodule Mix.Tasks.Verify do
+  use Mix.Task
+
+  @shortdoc "Verify the quintessence subset end to end"
+  @requirements ["compile"]
+
+  @impl Mix.Task
+  def run(argv) do
+    opts = OptionParser.parse!(argv, strict: [module: :string, layer: :string,
+      strict: :boolean, receipt: :boolean, replay: :boolean, format: :string])
+    |> elem(0)
+
+    # Mix ignores the return value of run/1; the exit status must be set
+    # explicitly, which is the whole point of the stable codes above.
+    with {:ok, project} <- Quintessence.Project.load(),
+         :ok <- Quintessence.Doctor.check!(project),
+         {:ok, qir} <- Quintessence.Frontend.elaborate(project, opts),
+         {:ok, obligations} <- Quintessence.Project.obligations(qir, opts),
+         {:ok, warrants} <- Quintessence.Echidna.dispatch(obligations, project),
+         {:ok, receipts} <- Quintessence.Batch.check(warrants, project),
+         :ok <- Quintessence.Mutation.check(qir, project),
+         :ok <- Quintessence.Gate.check(receipts, project, opts) do
+      Quintessence.Report.print(receipts, opts)
+      :ok
+    else
+      {:error, %Quintessence.Error{code: code} = err} ->
+        Quintessence.Report.error(err)
+        System.halt(Quintessence.Error.exit_code(code))
+    end
+  end
+end
+----
+
+The sketch is deliberately boring. The hard parts are the front end and the
+backends; the task should be a thin, testable orchestrator with no verification
+logic of its own.
+
+=== CI
+
+A release branch runs `mix verify --strict --receipt` and fails unless every
+Receipt is Level 5. A pull request may run `mix verify --layer a --allow-oracle`
+for fast feedback, but the merge gate runs the full command. The receipt file is
+committed to `priv/receipts/` and is part of the release artifact; a binary
+without a matching receipt is not releasable.
+
+[[roadmap]]
+== Roadmap summary
+
+The detailed plan is link:../status/QUINTESSENCE-ROADMAP.adoc[the roadmap]. The
+shape is:
+
+[cols="1,4,3",options="header"]
+|===
+| Phase | Deliverable | Exit criterion
+
+| 0 (weeks 0-2)
+| IR, receipt schemas, error codes, CI harness, pinned toolchain.
+| `.qir` round-trips; schemas validate; `mix quintessence.doctor` fails closed.
+
+| 1 (weeks 2-8)
+| Layer A: subset checker, Why3 projection, SMT route, Dedukti bridge for the
+  decidable fragment, Face attributes.
+| One real module proves 20+ VCs; mutation score >= 95%; no oracle in the
+  Receipt.
+
+| 2 (weeks 8-14)
+| Layer C: Idris2 ABI, ZigProve receipt import, `MaxPlus` straight-line bound,
+  NIF stub, dirty tagging.
+| One NIF ships with a Level 5 receipt; a 1.4 ms NIF is rejected or forced
+  dirty; a stale receipt fails to load.
+
+| 3 (weeks 14-20)
+| Layer B0: GenServer mapping, K-CUT static obligations, occupancy bound,
+  Apalache encoding.
+| The worked example passes; a cast-based claim is rejected with `Q-401`; a
+  bounded protocol counterexample is found and fixed.
+
+| 4 (weeks 20-28)
+| Layer B1: full reply-chain extension (co-develop with `choreographic-types`),
+  distributed loss, restart epochs, occupancy-types integration.
+| A three-message protocol is either proved (if the library extension lands) or
+  explicitly `assumed`; no silent overclaim.
+
+| 5 (weeks 28-36)
+| Evidence hardening: proved `why3-dk` translation, `transport` batch mode,
+  composition theorem in Agda, `--strict` release gate.
+| A Receipt is reproducible from the `.qir` alone; independent audit passes.
+
+| 6 (weeks 36+)
+| Scale: more modules, more primitives, editor integration, public alpha.
+| External users verify a nontrivial app without bespoke patches.
+|===
+
+The *MVP* is Phase 0 + Phase 1 + Phase 2 + Phase 3 on one module, one NIF, and
+one protocol. It is not "all of Elixir". It is a credible end-to-end receipt for
+a small, real system.
+
+[[risks]]
+== Risks and non-claims
+
+[cols="2,3,3",options="header"]
+|===
+| Risk | Why it matters | Mitigation
+
+| The K-CUT fragment is smaller than OTP.
+| Recursion, full merge, general reply chains, and data-dependent warrants are
+  open. A real GenServer protocol may not fit.
+| MVP restricts to acyclic, binary-choice, plain-merge protocols and the
+  two-message reply theorem. Phase 4 co-develops the reply-chain extension with
+  `choreographic-types`; until then, unsupported claims are `assumed`, not
+  green.
+
+| The Lean-to-Agda MaxPlus bridge is open.
+| Layer C's `MaxPlus` (Lean) and Layer B's `MaxPlus` (Agda) are the same algebra
+  in name, not one checked object.
+| Report them as separate discharges. Do not use a Layer C bound to justify a
+  Layer B grade without the bridge. Phase 5 work package.
+
+| Why3-to-Dedukti reconstruction is a TCB.
+| A wrong translation can prove a different theorem.
+| Restrict to the decidable fragment; name the translator; `dkcheck` the
+  result; Phase 5 proves the translation or keeps `translation: assumed`.
+
+| Apalache is bounded.
+| A protocol bug beyond the bound is missed.
+| Label `BOUNDED`; rely on K-CUT typing for the unbounded argument; increase
+  bounds in CI; use Apalache as a bug finder, not a proof.
+
+| The macro firewall is an OS sandbox, not a proof.
+| A malicious macro within the allowlist can still do damage.
+| Small allowlist; double expansion; bytecode audit; pinned compiler; reviewed
+  `@trusted_macro` receipts.
+
+| Rustler `ResourceArc` is not linear.
+| Two processes can share a resource; the Idris2 linear type does not bind the
+  BEAM.
+| Stub-level ownership token + generation check; receipt says
+  `linearity: stub-enforced`; do not claim kernel linearity.
+
+| ZigProve is an external contract.
+| Its obligation names and coverage may differ.
+| Adapter + semantic coverage check; missing obligation is `Q-301`; no NIF
+  without a complete receipt.
+
+| The BEAM scheduler is not proved.
+| The 1 ms guidance is approximate; dirty pools can saturate.
+| `MaxPlus` bound with margin; concurrency limit; trust ledger assumption;
+  measure in production.
+
+| Elixir AST drift.
+| Each Elixir release changes the AST and macro expansion.
+| Pin the compiler; canonicalize; golden tests per supported version; fail on an
+  unknown node rather than guessing.
+
+| Composition theorem not machine-checked.
+| The layers are individually checked; their composition is argued on paper.
+| Receipt records `composition: assumed`; Phase 5 closes it in Agda.
+|===
+
+The non-claims are as important as the claims:
+
+* Quintessence does not verify arbitrary Elixir, the BEAM, the Erlang
+  distribution protocol, or the Zig compiler.
+* A Receipt is evidence about the specified fragment, not a total correctness
+  statement about the application.
+* A `@trusted` boundary is an assumption with a receipt, not a proof.
+* A green `mix verify` on a module with an `assumed` K-CUT claim is not a green
+  K-CUT proof; the gate and the report must say so.
+
+[[traceability]]
+== Requirements traceability
+
+[cols="1,4,2",options="header"]
+|===
+| Requirement | Where it is addressed | Evidence
+
+| 1. Contrast with Dialyzer, set-theoretic types, PropEr/StreamData, Concuerror
+| <<contrast>>
+| Table and four-bug comparison.
+
+| 2. Sequential subset and macro firewall
+| <<layer-a>>, link:QUINTESSENCE-LAYER-A.adoc[Layer A]
+| Grammar, typing rules, firewall gates, error codes.
+
+| 3. `@cap`, `@pre`, `@post`, `@secret`, `@choreography`
+| <<face>>
+| Attribute table, complete example, elaboration rules.
+
+| 4. OTP mailbox, crash, K-CUT soundness
+| <<layer-b>>, link:QUINTESSENCE-LAYER-B.adoc[Layer B]
+| Mapping table, K-CUT rules, falsifier, occupancy, Apalache.
+
+| 5. Verified Zig NIF integration
+| <<layer-c>>, link:QUINTESSENCE-LAYER-C.adoc[Layer C]
+| QTT ABI, receipt, C1-C12, `MaxPlus`, stub.
+
+| 6. Worked dual example
+| <<worked-example>>, link:../../examples/quintessence/README.adoc[example]
+| Entity, NIF, protocol, mutation, pass/fail transcript.
+
+| 7. `mix verify` and phased roadmap
+| <<mix-verify>>, <<roadmap>>, link:../status/QUINTESSENCE-ROADMAP.adoc[roadmap]
+| CLI, config, exit codes, phases, exit criteria.
+|===
+
+[[foundations]]
+== Foundation pinning and maturity
+
+The estate libraries are not all at the same maturity. The specification pins
+what each one provides and what quintessence may claim from it.
+
+[cols="2,3,2,3",options="header"]
+|===
+| Foundation | Provides | Status | What quintessence may claim
+
+| `choreographic-types`
+| Graded multiparty session types; K-CUT-LOSS (sync + async); K-CUT-WARRANT
+  bound + transport; confirmed sender-blindness falsifier; `Loss`, `MaxPlus`,
+  `HWM` instances.
+| Agda, `--safe --without-K`, finite binary-choice plain-merge fragment.
+  Recursion, full merge, delegation, n-ary choice, general reply chain,
+  data-dependent warrants are open.
+| K-CUT claims only within the fragment. The two-message reply theorem is the
+  only receipt-grade reply claim.
+
+| `tropical-types`
+| Lean 4 max-plus semiring; `Resource.ResourceSemiring`; `MaxPlus` instance;
+  soundness and QTT refinement.
+| Lean 4, no Mathlib, pinned toolchain.
+| Layer C `MaxPlus` bounds and the scheduler threshold arithmetic.
+
+| `occupancy-types`
+| Session IR calculus/checker; operational model; HWM readings; linear
+  buffers/endpoints.
+| Early-stage (R0-B/R1); HWM grade algebra planned, not a second semiring.
+| Mailbox/queue discipline and HWM readings. Not a cost bound; not a K-CUT
+  proof by itself.
+
+| `secret-types`
+| TINI for a two-point lattice and later a generic lattice; explicit
+  declassification; rejection tests.
+| Agda, core theorem proven for a two-variable `while` fragment.
+| The `@secret`/`@declassify` discipline, instantiated for the Face. The full
+  Elixir language is not covered.
+
+| `epistemic-types`
+| Kripke modalities, `Warrant`, `SoundWarrant`, `ProofTransport`, access
+  preorder.
+| Agda prototype; world-indexed records added upstream.
+| The vocabulary and the `SoundWarrant` side-condition. Not a replacement for
+  `choreographic-types`' frame.
+
+| `echo-types`
+| Loss grades and residues.
+| Imported by `choreographic-types` at a pin for the base case.
+| Loss grades only; no new echo machinery.
+
+| MPR
+| Capability footprint `Sigma`; ambient authority ban.
+| Estate contract; no public pinned revision in this checkout.
+| The `@cap` footprint and the R5 composition rule, via an adapter. Marked
+  `assumed` until the revision is pinned.
+
+| ZigProve
+| Zig memory obligations and receipt.
+| Estate contract; no public pinned revision in this checkout.
+| Layer C receipt import, subject to the coverage check. Marked `assumed` until
+  pinned.
+
+| ECHIDNA
+| Prover orchestration; `TrustLevel` 1-5; certificates; axiom tracking;
+  `MutationTester` (95% default).
+| Rust, active; `src/rust/verification/mutation.rs`.
+| Warrants, Receipts, trust levels, mutation/vacuity reports.
+|===
+
+The rule is simple: a foundation's *proved fragment* is a hard boundary. Quintessence
+may build instances, adapters, and interfaces around it; it may not extend the
+fragment by assertion. Where the estate library is early-stage, the quintessence
+receipt says `assumed` and the roadmap carries the co-development work.
+
+== Appendix A: Glossary
+
+[cols="1,4",options="header"]
+|===
+| Term | Meaning
+
+| `@cap` | Capability footprint attribute; an MPR `Sigma`.
+| `@choreography` | Module attribute declaring roles, messages, knowledge, and forbidden claims.
+| `@declassify` | Explicit secret-to-public release with a reason.
+| `@nif` | NIF stub attribute; imports a receipt and a schedule.
+| `@pre` / `@post` | Pre- and postcondition attributes; `spec(...)` quoted ASTs.
+| `@secret` | Confidentiality label attribute.
+| Apalache | Symbolic bounded model checker for TLA+.
+| Cut | A consistent frontier across a protocol's causal order.
+| Dedukti | Logical framework and type checker for `.dk` proofs.
+| ECHIDNA | Estate prover orchestrator and trust pipeline.
+| K-CUT-LOSS | Grading commutes with endpoint projection across a cut.
+| K-CUT-WARRANT | Knowledge/transport bound across a cut, under `SoundWarrant`.
+| MaxPlus | Tropical semiring `(max, +)` for worst-case cost.
+| MPR | Capability-footprint discipline banning ambient authority.
+| QIR | Quintessence Core Spec IR, `qir/v1`.
+| Receipt | Batch-kernel-checked evidence at ECHIDNA trust level 5.
+| TINI | Termination-insensitive noninterference.
+| Vacuity | A specification whose antecedent is unsatisfiable or whose postcondition is trivial.
+| Warrant | Local, content-addressed evidence; incomplete until batch-checked.
+| ZigProve | Estate Zig verification tool; produces Layer C receipts.
+|===
+
+== Appendix B: Error codes
+
+[cols="1,3",options="header"]
+|===
+| Range | Area
+
+| `Q-1xx` | G0 firewall: macro allowlist, sandbox, determinism, bytecode audit.
+| `Q-2xx` | Subset and Face: unsupported construct, match coverage, attributes, secrets, measures.
+| `Q-3xx` | Layer C: receipt, ABI, schedule, `MaxPlus`, target.
+| `Q-4xx` | Layer B: choreography well-formedness, unwarranted claim, fragment, occupancy.
+| `Q-5xx` | Evidence: prover failure, axiom, kernel mismatch, incomplete receipt.
+| `Q-6xx` | Vacuity and mutation: unsat pre, trivial post, weak spec, unreachable protocol, bounded counterexample.
+| `Q-9xx` | Infrastructure: toolchain, serialization, policy.
+|===
+
+Each range is defined by the document that owns it:
+link:QUINTESSENCE-LAYER-A.adoc[Layer A] for `Q-1xx` and `Q-2xx`,
+link:QUINTESSENCE-LAYER-C.adoc[Layer C] for `Q-3xx`,
+link:QUINTESSENCE-LAYER-B.adoc[Layer B] for `Q-4xx`, and
+link:QUINTESSENCE-EVIDENCE.adoc[Evidence] for `Q-5xx` and `Q-6xx`. The
+infrastructure codes are:
+
+[cols="1,3",options="header"]
+|===
+| Code | Meaning
+
+| `Q-901` | A required toolchain component is missing or the wrong version.
+| `Q-902` | Canonical serialization or IPC failed; the bytes are not the bytes
+  that were hashed.
+| `Q-905` | The configured policy rejects the evidence (a trust level, an axiom,
+  or a schedule).
+|===
+
+Every code has a stable meaning; adding a code is a minor version, changing a
+meaning is a major version.

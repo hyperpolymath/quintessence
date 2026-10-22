@@ -1,0 +1,655 @@
+// SPDX-License-Identifier: CC-BY-SA-4.0
+// Copyright (c) 2026 Jonathan D.A. Jewell <j.d.a.jewell@open.ac.uk>
+= Quintessence Layer A: Sequential Functional Elixir
+:toc:
+:toc-placement: preamble
+:toc-title: Contents
+:doctype: article
+:revdate: 2026-10-22
+:revnumber: 0.1.0-draft
+
+This is the detailed design of Layer A: the pure, total fragment of Elixir that
+quintessence turns into Why3 verification conditions, Dedukti witnesses, and an
+information-flow proof. It assumes the architecture in
+link:QUINTESSENCE.adoc[the main specification].
+
+[IMPORTANT]
+====
+Reference design, not a compiled implementation. The grammar and rules are
+normative; the code is illustrative. No toolchain is invoked by this checkout.
+====
+
+== Scope
+
+Layer A covers functions that are:
+
+* pure: no process, mailbox, port, file, network, clock, random, or ETS access;
+* total: every recursion decreases a declared measure;
+* first-order: no escaping closures, no higher-order state;
+* data-only: integers, atoms, booleans, binaries, lists, maps, tuples, structs,
+  options, and result values.
+
+A function outside this fragment is rejected (`Q-201`) rather than approximated.
+The rejection is the feature: an approximated function has no proof.
+
+== Surface grammar
+
+The grammar is a subset of Elixir's expression grammar after macro expansion. It
+is written in EBNF; `{ x }` means repetition, `[ x ]` means optional.
+
+[source,ebnf]
+----
+expr    ::= literal
+          | var
+          | expr binop expr
+          | unop expr
+          | "if" expr "do" expr "else" expr "end"
+          | "case" expr "do" clause { clause } "end"
+          | "{" [ expr { "," expr } ] "}"
+          | "[" [ expr { "," expr } ] "]"
+          | "%{" [ map_pair { "," map_pair } ] "}"
+          | "%" alias "{" [ field_pair { "," field_pair } ] "}"
+          | callee "(" [ expr { "," expr } ] ")"
+          | var "=" expr
+
+clause  ::= pattern [ "when" guard ] "->" expr
+pattern ::= "_" | var | literal
+          | "{" [ pattern { "," pattern } ] "}"
+          | "[" [ pattern { "," pattern } ] "]"
+          | "%{" [ map_pattern { "," map_pattern } ] "}"
+          | "%" alias "{" [ field_pattern { "," field_pattern } ] "}"
+          | pattern "=" pattern
+          | "^" var
+
+guard   ::= gexpr
+          | guard "and" guard
+          | guard "or" guard
+          | "not" guard
+
+gexpr   ::= "is_integer" "(" var ")" | "is_binary" "(" var ")"
+          | "is_atom" "(" var ")" | "is_list" "(" var ")"
+          | "is_map" "(" var ")" | "is_boolean" "(" var ")"
+          | "byte_size" "(" var ")" | "length" "(" var ")"
+          | var cmp var | var cmp literal
+          | var "in" "[" literal { "," literal } "]"
+          | var arith var
+
+binop   ::= "+" | "-" | "*" | "div" | "rem"
+          | "==" | "!=" | "<" | "<=" | ">" | ">="
+          | "and" | "or" | "<>"
+unop    ::= "-" | "not"
+callee  ::= var | alias "." var
+alias   ::= "Elixir."? UpperIdent {"." UpperIdent}
+----
+
+The elaborator works on the *expanded* AST, so `if`, `unless`, `with`, `for`,
+and the pipe operator are already reduced to `case`/function calls (or rejected,
+for `for`). The grammar above is the post-expansion surface, not the source
+surface; the Face attributes are attached to source definitions before expansion.
+
+== Base types and refinements
+
+[cols="2,3",options="header"]
+|===
+| Type | Representation / invariant
+| `integer` | Mathematical integer. Elixir bignums are exact; no overflow.
+| `nat` | `{n : integer \| 0 <= n}`
+| `boolean` | `true` or `false`
+| `atom` | A finite atom type, inferred from literals and specs
+| `binary` | Byte string with `byte_size` and `binary_part`
+| `bitstring` | Bit string; byte-aligned in the MVP
+| `list(a)` | Finite cons list
+| `map(k, v)` | Finite functional map
+| `tuple(a, b, ...)` | Fixed arity, positional
+| `struct(M)` | A map with `__struct__ = M` and declared fields
+| `option(a)` | `:none` or `{:some, a}`
+| `result(a, e)` | `{:ok, a}` or `{:error, e}`
+|===
+
+Refinements are predicates over a distinguished value variable:
+
+[source,text]
+----
+{ v : integer | 0 <= v and v <= 1048576 }
+{ s : binary  | byte_size(s) <= 1048576 }
+{ xs : list(integer) | length(xs) <= 1024 }
+----
+
+The elaborator keeps refinements in a normal form: conjunctions of linear
+arithmetic atoms, equalities over uninterpreted functions, finite-map operations,
+and length/byte-size atoms. Anything outside the fragment is rejected rather than
+sent to SMT as an opaque predicate. This is what makes the Dedukti
+reconstruction tractable.
+
+== Typing rules
+
+The judgment is
+
+[source,text]
+----
+Gamma ; Sigma |- e : { v : T | phi } @ ell
+----
+
+where `Gamma` maps variables to refined types, `Sigma` is the capability
+footprint, `ell` is the confidentiality label, and `phi` may mention `v` and the
+variables in `Gamma`.
+
+Selected rules:
+
+[source,text]
+----
+(x : {v:T | phi}) in Gamma
+-------------------------------- T-Var
+Gamma ; Sigma |- x : {v:T | phi[x/v]} @ ell(x)
+
+---------------------------- T-Int
+Gamma ; Sigma |- n : {v:integer | v = n} @ public
+
+Gamma ; Sigma |- e1 : {v:T1 | phi1} @ l1
+Gamma ; Sigma |- e2 : {v:T2 | phi2} @ l2
+l = l1 join l2
+-------------------------------- T-Pair
+Gamma ; Sigma |- {e1, e2} : {v:T1*T2 | phi1[fst v/v] and phi2[snd v/v]} @ l
+
+Gamma ; Sigma |- e : {v:T | phi} @ l
+for each i: Gamma, pat_i : T, guard_i |- branch_i : {v:U | psi_i} @ l
+exhaustive(pat_1 ... pat_n)
+-------------------------------- T-Case
+Gamma ; Sigma |- case e of pat_i when guard_i -> branch_i end
+  : {v:U | psi} @ l
+  where psi = forall i. (phi and guard_i) => psi_i
+
+Gamma ; Sigma |- e : {v:T | phi} @ l
+Gamma, x : {v:T | phi} ; Sigma |- body : {v:U | psi} @ l'
+-------------------------------- T-Let
+Gamma ; Sigma |- x = e; body : {v:U | psi[e/x]} @ l join l'
+----
+
+The `T-Case` rule is the heart of the refinement discipline. Each branch receives
+the scrutinee's refinement plus the branch guard; the result's refinement is the
+conjunction of the branch refinements under their guards. If a branch is
+unreachable, its implication is vacuous; that is checked, not assumed. If the
+match is non-exhaustive, the rule does not apply (`Q-202`).
+
+Function application:
+
+[source,text]
+----
+f : (x_1 : T_1) -> ... -> (x_n : T_n) -> {v:U | psi} in Gamma
+Gamma ; Sigma |- a_i : {v:T_i | phi_i} @ l_i
+-------------------------------- T-App
+Gamma ; Sigma |- f(a_1, ..., a_n)
+  : {v:U | psi[a_i/x_i]} @ join(l_1, ..., l_n)
+  with side condition: pre_f[a_i/x_i] is entailed by phi_1 ... phi_n
+----
+
+The side condition is the proof obligation that the caller meets the callee's
+precondition. It is generated as a VC; it is not a runtime check.
+
+== Guards and pattern refinement
+
+A guard is a conjunction of decidable atoms. The elaborator translates each atom
+into a refinement:
+
+[cols="2,3",options="header"]
+|===
+| Guard | Refinement
+| `is_integer(x)` | `x : integer`
+| `is_binary(x)` | `x : binary`
+| `byte_size(x) <= n` | `byte_size(x) <= n`
+| `x > n` | `x > n`
+| `x in [a, b, c]` | `x = a or x = b or x = c`
+| `is_atom(x)` | `x : atom`
+| `length(xs) <= n` | `length(xs) <= n`
+|===
+
+Guards that cannot be expressed in the refinement fragment are rejected
+(`Q-201`), not treated as opaque booleans. This prevents the classic
+"guard says `valid?(x)` but the solver knows nothing" hole.
+
+Pattern matching refines map and struct fields structurally. For a map pattern
+`%{id: id, digest: d}`, the branch receives `id in keys(m)`, `d = m[id]`, and the
+map's remaining keys are unconstrained. For a struct pattern, the field types and
+invariants are projected from the struct declaration. A missing field is a type
+error, not a runtime `KeyError`.
+
+== Totality and measures
+
+A recursive definition is accepted only with a measure in one of these forms:
+
+[source,text]
+----
+measure ::= size(x)                  -- list/map/binary/tuple size
+          | n - k                    -- affine variant of a nat parameter
+          | lex(m1, m2, ...)         -- lexicographic product
+          | f(args)                  -- user function, must be nat-valued and total
+----
+
+For each recursive call, the elaborator emits:
+
+[source,text]
+----
+0 <= measure(args')  and  measure(args') < measure(current args)
+----
+
+Why3 discharges these with the same SMT portfolio. If a decrease obligation is
+`unknown`, the function is rejected; there is no "trust the termination checker"
+mode. For `Enum.reduce`, the measure is the length of the input list and the
+reducer must be total; a reducer that calls back into a non-total function is
+`Q-206`.
+
+Mutual recursion is accepted only with a lexicographic measure over the tuple of
+arguments, and only when the call graph is a finite DAG of strongly connected
+components. The MVP does not support mutual recursion; it is Phase 4.
+
+== Why3 projection
+
+The projection is a total function `to_why : Term -> WhyML`. The mapping for the
+core constructs:
+
+[cols="2,3,3",options="header"]
+|===
+| IR | WhyML | Notes
+| `Var`, `Const` | `x`, `c` | Names are fully qualified and collision-free.
+| `Con` | constructor application | ADTs are declared in a generated `types` module.
+| `App` | `f a1 ... an` | Precondition becomes a `requires` on the callee and a VC at the call site.
+| `Lam` | rejected | No first-class functions in the MVP.
+| `Let` | `let x = e in body` | Refinements become assertions where needed.
+| `Match` | `match e with ...` | Exhaustiveness is checked before projection.
+| `Prim` | Why3 library call | Table below.
+| `Do` | sequence | Only in `IO`-free helper functions; `Do` is erased otherwise.
+| `NifCall` | uninterpreted function | The receipt links it to the implementation.
+| `Budget` | ghost annotation | Erased; used by Layer C.
+|===
+
+Primitive mapping:
+
+[cols="2,3",options="header"]
+|===
+| Elixir | Why3
+| `+`, `-`, `*` | `+`, `-`, `*` on `int`
+| `div`, `rem` | `div`, `mod` with `b <> 0`
+| `==`, `!=`, `<`, `<=`, `>` | `=`, `<>`, `<`, `<=`, `>`
+| `byte_size/1` | `Bytes.length`
+| `binary_part/3` | `Bytes.substring` with bounds
+| `<>` | `Bytes.concat`
+| `length/1` | `List.length`
+| `Map.get/3` | `Map.get`
+| `Map.put/3` | `Map.set`
+| `Map.fetch/2` | `Map.get` plus a membership test
+| `Enum.map/2` | `List.map` (after inlining a total lambda)
+| `Enum.filter/2` | `List.filter`
+| `Enum.reduce/3` | `List.fold_left` with a measure
+|===
+
+A full example:
+
+[source,elixir]
+----
+defmodule Verisim.Spec do
+  @pre spec(byte_size(payload) <= 1_048_576)
+  @post spec(result == digest_of(payload))
+  def digest(payload), do: digest_of(payload)
+
+  @pre spec(byte_size(payload) <= 1_048_576)
+  @post spec(
+    case result do
+      {:ok, d} -> d == digest_of(payload)
+      {:error, _} -> true
+    end
+  )
+  def checked_digest(payload) do
+    if byte_size(payload) == 0 do
+      {:error, :empty}
+    else
+      {:ok, digest_of(payload)}
+    end
+  end
+end
+----
+
+projects to:
+
+[source,whyml]
+----
+module Verisim_Spec
+
+  use int.Int
+  use bytes.Bytes
+
+  function digest_of (b: bytes) : bytes
+
+  let digest (payload: bytes) : bytes
+    requires { Bytes.length payload <= 1048576 }
+    ensures  { result = digest_of payload }
+  = digest_of payload
+
+  let checked_digest (payload: bytes) : result bytes string
+    requires { Bytes.length payload <= 1048576 }
+    ensures  { match result with
+               | Ok d -> d = digest_of payload
+               | Error _ -> true
+               end }
+  = if Bytes.length payload = 0
+    then Error "empty"
+    else Ok (digest_of payload)
+
+end
+----
+
+Why3's `result` is the return value in `ensures`; `old` is available for
+stateful functions. The Elixir `old` in `@post` maps to `old` in WhyML.
+
+== VC generation and the Dedukti witness
+
+Why3 splits each function's verification condition at match branches, assertions,
+and `let` boundaries. The output is a set of named goals:
+
+[source,text]
+----
+Verisim_Spec.checked_digest'vc
+Verisim_Spec.checked_digest'vc.0   -- empty branch
+Verisim_Spec.checked_digest'vc.1   -- non-empty branch
+----
+
+Each goal is sent to the SMT portfolio (`z3`, `cvc5`, `alt-ergo`) with a
+timeout. An `unsat` answer is necessary but not sufficient for a Receipt. The
+`why3-dk` pass reconstructs a Dedukti proof for goals in the *reconstructible
+fragment*:
+
+* quantifier-free linear integer arithmetic;
+* equality and congruence;
+* uninterpreted functions;
+* algebraic data types with constructor disjointness and injectivity;
+* finite maps with `get`/`set` axioms;
+* byte strings with length and substring axioms.
+
+The reconstruction is not a transcript of the SMT solver's internal proof. It is
+a proof term built from the goal's clausification and the fragment's rules. That
+makes it independent of the solver, and it makes the translator a TCB component:
+the `.dk` term must be checked by `dkcheck`, and the translator must be reviewed
+(and, in Phase 5, proved).
+
+A schematic `.dk` file:
+
+[source,text]
+----
+# why3-dk output, fragment: QF-LIA + UF + bytes
+bytes : Type.
+length : bytes -> int.
+digest_of : bytes -> bytes.
+checked_digest : bytes -> result.
+
+ax_length_nonneg : Pi (b : bytes). 0 <= length b.
+
+thm_checked_digest_post :
+  Pi (payload : bytes).
+  length payload <= 1048576 ->
+  Pi (r : result).
+  r = checked_digest payload ->
+  (Sigma (d : bytes). r = Ok d /\ d = digest_of payload) \/
+  (Sigma (e : string). r = Error e).
+----
+
+The real output is a full λΠ term, not a statement. The point of the sketch is
+the shape: the theorem is about the same `checked_digest` and `digest_of` that
+Why3 used. If the translator cannot produce a term, the goal is `UNCHECKED` and
+cannot enter a Receipt.
+
+== Information flow: `@secret`, `@declassify`, and MPR R5
+
+The label lattice for the MVP is two-point:
+
+[source,text]
+----
+public <= internal <= confidential <= secret
+----
+
+The typing judgment carries a label; the rules are standard TINI:
+
+[source,text]
+----
+Gamma |- e : T @ l
+l <= l'
+---------------- T-SubLabel
+Gamma |- e : T @ l'
+
+Gamma, x : T @ l |- e : U @ l'
+l' <= l
+---------------- T-Fun
+Gamma |- (x) -> e : (x : T @ l) -> U @ l'
+
+Gamma |- e : T @ secret
+Gamma |- declassify(e, reason) : T @ public
+  with obligation: reason is a declared declassification policy
+---------------- T-Declass
+----
+
+Implicit flows are controlled by the PC label: a branch on a secret raises the
+label of everything computed inside it. A secret-dependent `if` that returns a
+public value is rejected unless the whole expression is declassified.
+
+The MPR R5 composition rule is a separate check over the process footprint. A
+process's footprint is a set of `(capability, resource, label)` triples. The
+corridor relation is
+
+[source,text]
+----
+read  in Sigma, write in Sigma, label(read) !<= label(write)
+------------------------------------------------------------ R5-VIOLATION
+Sigma is an exfiltration corridor
+----
+
+For example, a process that reads a `:confidential` entity field and writes to a
+`:public` network socket is a corridor. The checker rejects it unless there is a
+`@declassify` on the value and a policy that permits the release. The rule is
+*compositional*: checking each function in isolation would miss the pair, so the
+elaborator computes the footprint product for every process and for every
+module that can be composed into a process.
+
+The canonical `fs.read || net.send` example is rejected for two reasons: the
+ambient `File` and `:gen_tcp` capabilities are absent from the default `Sigma`,
+and the label flow is a corridor. A future verified `read_file`/`send_socket`
+pair would still need the label proof.
+
+The MPR adapter maps `@cap` atoms to MPR capability names:
+
+[cols="2,2",options="header"]
+|===
+| Face | MPR `Sigma`
+| `read: [:entity]` | `read(entity)`
+| `write: [:entity]` | `write(entity)`
+| `call: [{Verisim.Nif, [hash: 2]}]` | `call(Verisim.Nif, hash, 2)`
+| `clock` | `clock`
+| `rand` | `rand`
+| `log` | `log`
+| `fs`, `system`, `port`, `eval` | absent by default; require an explicit grant
+|===
+
+If the pinned MPR revision uses different names, only the adapter changes. The
+R5 rule and the obligation are quintessence's; the capability algebra is MPR's.
+
+== The macro-expansion firewall
+
+The firewall has three gates. Each gate is independent; a bypass in one is caught
+by another where possible, and the trust ledger says where it is not.
+
+=== G0a: static allowlist and banned calls
+
+`use Quintessence.Face` installs a compiler tracer via
+`Code.put_compiler_option(:tracers, [Quintessence.Tracer])`. The tracer receives
+events including:
+
+[source,elixir]
+----
+{:remote_macro, meta, module, name, arity}
+{:local_macro, meta, name, arity}
+{:imported_macro, meta, module, name, arity}
+{:remote_function, meta, module, name, arity}
+----
+
+Every macro event is checked against `quintessence.macros`, a reviewed allowlist:
+
+[source,text]
+----
+Kernel: defmodule/2, def/2, defp/2, defstruct/1, defguard/1, defdelegate/2,
+        if/2, unless/2, case/2, cond/1, with/1, |>/2, <>_/2, and/2, or/2,
+        not/1, in/2, =~/2, is_*_/1
+GenServer: __using__/1
+Quintessence.Face: __using__/1, spec/1
+Enum, List, Map, MapSet, Keyword: functions only (no macros)
+Bitwise: band/2, bor/2, bxor/2, bsl/2, bsr/2, bnot/1 (lowered to :erlang)
+----
+
+Everything else is `Q-101` unless the module carries a `@trusted_macro` receipt.
+The receipt names the macro module, version, hash, and the reviewer; it is
+committed next to the source. A `@trusted_macro` is not a blank cheque: the
+receipt is checked by G0b and by the bytecode audit.
+
+The AST is then scanned for banned calls. The scan is syntactic but
+conservative:
+
+[cols="2,2,2",options="header"]
+|===
+| Banned | Why | Error
+| `Code.eval_quoted/2,3`, `Code.eval_string/1,2,3` | arbitrary code at compile time | `Q-102`
+| `Code.compile_quoted/1`, `Code.compile_string/1`, `Code.require_file/1` | dynamic compilation | `Q-103`
+| `Module.create/3`, `Module.concat/1,2` | dynamic module names | `Q-104`
+| `apply/2,3`, `Kernel.apply/2,3`, `:erlang.apply/2,3` | dynamic dispatch | `Q-105`
+| `:erlang.load_nif/2`, `:erlang.load_driver/1` | unverified native code | `Q-106`
+| `String.to_atom/1`, `:erlang.list_to_atom/1`, `:erlang.binary_to_atom/2` | atom-table exhaustion | `Q-107`
+| `:os.cmd/1`, `System.cmd/2,3`, `Port.open/2` | ambient process authority | `Q-108`
+| `File.*`, `:file.*`, `:httpc.*`, `:gen_tcp.*`, `:ssl.*` | ambient I/O | `Q-109`
+| `spawn`, `send`, `receive`, `Task.*`, `Agent.*` | not Layer A | `Q-201`
+|===
+
+The ban on `apply/3` has no exception in verified modules. A static call is
+always expressible; if it is not, the code is outside the fragment.
+
+=== G0b: sandboxed deterministic expansion
+
+Expansion runs in a separate OS process, not in the compiler's process. The
+sandbox is a `bubblewrap`/`nsjail` profile with:
+
+[source,text]
+----
+--ro-bind  $PWD /src          # source is read-only
+--tmpfs   /tmp               # no persistent writes
+--unshare-net                # no network
+--die-with-parent
+--setenv TZ UTC
+--setenv LANG C
+--setenv LC_ALL C
+--setenv SOURCE_DATE_EPOCH 0
+--setenv MIX_ENV prod
+--setenv ERL_FLAGS "+S 1:1"  # one scheduler, deterministic
+----
+
+The expander seeds `:rand` with a fixed seed, clears the environment except the
+listed variables, and runs twice in two fresh processes. The canonical expanded
+AST is hashed with source locations stripped:
+
+[source,elixir]
+----
+ast1 = Quintessence.Sandbox.expand(path, seed: {0, 0, 0})
+ast2 = Quintessence.Sandbox.expand(path, seed: {0, 0, 0})
+
+if Quintessence.AST.hash(ast1) != Quintessence.AST.hash(ast2) do
+  raise Quintessence.Error, code: "Q-110", message: "non-deterministic macro expansion"
+end
+----
+
+A macro that reads the clock, the scheduler count, the hostname, an environment
+variable, a random seed, or a file outside the source tree will produce a
+different hash and be rejected. A macro that reads a *stable* environment
+variable is still rejected unless the variable is on the allowlist, because the
+expansion is part of the proof identity.
+
+If `bubblewrap`/`nsjail` is unavailable, G0b fails closed (`Q-111`). There is no
+"run unsandboxed" mode in `--strict`; a developer may pass
+`--allow-unsafe-expansion` locally, but the resulting `.qir` is stamped
+`expansion: unsafe` and cannot enter a Receipt.
+
+=== G0c: bytecode import audit
+
+After compilation, the `.beam` file is read with `:beam_lib.chunks/2`:
+
+[source,elixir]
+----
+{:ok, {_, [imports: imports, atoms: atoms]}} =
+  :beam_lib.chunks(beam_path, [:imports, :atoms])
+
+# imports :: [{module, [{fun, arity}]}]
+Enum.each(imports, fn {mod, funs} ->
+  Enum.each(funs, fn {fun, arity} ->
+    unless Quintessence.Imports.allowed?(mod, fun, arity) do
+      raise Quintessence.Error, code: "Q-112", message: "#{mod}.#{fun}/#{arity}"
+    end
+  end)
+end)
+
+# Banned atoms catch dynamically constructed calls that the AST scan missed.
+unless Enum.all?(atoms, &Quintessence.Atoms.allowed?/1) do
+  raise Quintessence.Error, code: "Q-113"
+end
+----
+
+The import table catches static remote calls. It does not catch `apply/3` with a
+computed module; G0a rejects the literal `apply` and `Module.concat`, and the
+atom audit catches the constructed atom. The combination is not a proof of
+non-interference, but it closes the obvious holes.
+
+=== What the firewall does not do
+
+* It does not sandbox *runtime*. A verified module can still call a banned
+  function through a `@trusted` boundary; the boundary is named in the receipt.
+* It does not prove that an allowed macro is semantically correct. The allowlist
+  is a reviewed TCB.
+* It does not prevent a macro from emitting a *valid but wrong* AST. That is
+  caught by the subset checker and the VCs, not by the firewall.
+* It does not protect against a compromised Elixir compiler. The compiler is in
+  the trust ledger.
+
+== Validation strategy
+
+Layer A is validated at four levels:
+
+. *Golden corpus.* A set of small modules with hand-written `.qir` and expected
+  VCs. Any change to the elaborator that changes a hash or a VC is reviewed.
+. *Differential testing.* For every function in the corpus, generate random
+  inputs and compare the Elixir result with the Why3 model's result (via Why3's
+  extraction or a reference interpreter). A mismatch is a bug in the model or
+  the code.
+. *Mutation testing.* ECHIDNA mutates the specification and the implementation;
+  a surviving mutant is a missing postcondition or a weak VC.
+. *Proof replay.* `why3 replay` re-runs the saved proof sessions; a proof that no
+  longer checks is a regression.
+
+The corpus is deliberately adversarial: empty lists, zero-length binaries,
+maximum sizes, maps with missing keys, and branches that are unreachable under
+the precondition. A specification that only passes on the happy path is a
+vacuous specification with good marketing.
+
+== Open issues
+
+* *Floats.* The MVP rejects them. `drift` is modeled in basis points, not as a
+  float, because SMT floating-point reasoning is a different theory and the
+  BEAM's float semantics are not the IEEE754 model we would want to prove
+  against.
+* *Bignums.* Elixir integers are arbitrary precision; Why3 `int` is mathematical.
+  This is a good match for pure code, but a NIF that takes a `u64` needs a range
+  refinement at the boundary. Layer C carries that obligation.
+* *Bitstrings.* Byte-aligned binaries are modeled; arbitrary bit-level matching
+  is Phase 4.
+* *Closures.* First-class functions are rejected in the MVP. `Enum.map` with a
+  literal lambda is inlined; a closure that escapes is `Q-201`.
+* *`Enum.reduce` measures.* Inferring a decreasing measure for an arbitrary
+  reducer is hard. The MVP requires an explicit `@measure`; Phase 3 adds
+  inference for the common `acc`-size patterns.
+* *Map ordering.* Why3 maps are functional; Elixir maps have no observable order
+  in the subset. The canonical form sorts keys for hashing, not for semantics.
+* *Struct updates.* `%{s | f: v}` is pure and modeled; a struct with a field
+  that is a function or a PID is rejected.
+* *Exceptions.* `raise` is rejected in the pure subset. A function that can fail
+  returns `result`; this is a source-level discipline, not an automatic
+  translation.

@@ -1,0 +1,130 @@
+// SPDX-License-Identifier: CC-BY-SA-4.0
+// Copyright (c) 2026 Jonathan D.A. Jewell <j.d.a.jewell@open.ac.uk>
+= Architecture Decision Record: 0004-three-layer-architecture
+:toc:
+:toc-placement: preamble
+:toc-title: Contents
+:doctype: article
+
+== 4. Three layers, one IR, one evidence ladder
+
+Date: 2026-10-22
+
+=== Status
+
+Accepted. The decision is about the *shape* of the verification suite; it does
+not assert that any layer is implemented. Implementation status is tracked in
+link:../status/QUINTESSENCE-ROADMAP.adoc[the roadmap].
+
+=== Context
+
+Elixir code mixes three kinds of claim that need three different logics:
+
+. A pure function's postcondition is a statement about *all* inputs of a
+  sequential program. SMT and Why3 are the mature route.
+. A `GenServer`'s knowledge of a remote commit is a statement about *messages,
+  cuts, and causality*. A sequential logic cannot express it, and a type checker
+  cannot prove it.
+. A NIF's safety is a statement about *memory, ABI layout, and time*. It needs a
+  linear type discipline for handles and a cost bound that the BEAM scheduler
+  understands.
+
+The estate already contains the theory for the second and third: an Agda
+`choreographic-types` development with K-CUT results, a Lean `tropical-types`
+development with a `MaxPlus` resource semiring, `occupancy-types` for step
+bounds, and `secret-types`/`epistemic-types` for information flow and knowledge.
+It also contains ECHIDNA, which already knows how to dispatch a goal to an SMT
+portfolio, check a certificate, track axioms, and compute a trust level.
+
+The rejected alternative was a single tool for "all of Elixir". Every such tool
+either (a) proves only the pure fragment and silently ignores the rest, or
+(b) models the OTP layer as a state machine and loses the knowledge semantics
+that make a `cast` claim false. Both failure modes are worse than a narrow tool
+that states its boundary.
+
+=== Decision
+
+1. *Three layers, one IR.* The front end filters Elixir through a deterministic
+   macro firewall, checks a sequential subset, and elaborates the surviving
+   modules plus the Face attributes into one small, total, content-addressed
+   Idris2 Core Spec IR (`qir/v1`). All three layers consume the same IR; none
+   re-parses Elixir.
+2. *Each layer has one theory and one checker.* Layer A: Why3/SMT, with a
+   strict Dedukti witness for the decidable fragment. Layer B: the pinned
+   `choreographic-types` K-CUT results plus Apalache for a bounded instance
+   check. Layer C: the Idris2 ABI/QTT specification, the ZigProve receipt, and
+   the `tropical-types` `MaxPlus` bound.
+3. *Evidence has two forms.* A local, content-addressed *Warrant* is
+   `incomplete` until the batch stage rechecks it in Coq and Lean; a *Receipt*
+   is the batch-checked object and is the only thing a release gate accepts.
+4. *The trust ledger is explicit.* Every imported library, checker, and
+   assumption is listed with what it is trusted for and what breaks if it is
+   wrong. Where a library is partial (for example, `occupancy-types` does not
+   grade high-water marks in v0), the document says so and the composition is
+   marked as an assumption rather than a theorem.
+5. *The boundary is enforced, not documented.* `Code.eval_*`, dynamic
+   `apply/3`, unverified NIFs, and cross-process knowledge claims without a
+   causal reply are *compile-time errors*, not lint warnings.
+
+=== Consequences
+
+==== Positive
+
+- Each layer can be validated independently: the IR round-trips, the Layer A
+  VCs are SMT-sized, the Layer B instance is finite, and the Layer C receipt is
+  a JSON object with a binary hash.
+- The pinned estate libraries are reused rather than re-derived. The K-CUT
+  metatheory stays in Agda; the `MaxPlus` algebra stays in Lean; quintessence
+  builds adapters, not parallel theories.
+- A missing tool or a stale receipt fails closed at `mix quintessence.doctor` or
+  at NIF load time, so "not verified" cannot be mistaken for "verified".
+- The same IR makes cross-layer claims checkable: a `@choreography` attribute and
+  a `@nif` budget refer to the same obligation graph.
+
+==== Negative
+
+- Three logics mean three failure vocabularies. The error-code ranges
+  (`Q-1xx` to `Q-9xx`) and the single `mix verify` report exist to hide that
+  complexity from the user, but the implementer pays for it.
+- The Layer B fragment is deliberately small: finite global types, binary
+  choice, plain merge, and the two-message reply theorem. A three-party reply
+  chain is `assumed` until the library extension lands; the tool must say so.
+- The Dedukti route for Layer A is a named TCB component until Phase 5 proves
+  the translation, so early receipts carry an explicit assumption.
+- A Receipt is expensive: batch Coq and Lean checks dominate CI time. Caching
+  and `--replay` are required, not optional.
+
+==== Neutral
+
+- The worked example is a `VerisimDB`-style entity because that domain has a
+  natural digest, a natural drift metric, and a natural two-message protocol.
+  The choice is illustrative, not normative.
+- `mix verify` is the only entry point. Editors and CI call it; no second
+  pipeline is permitted.
+
+=== Alternatives considered
+
+* *Dialyzer plus set-theoretic types.* Rejected as a proof: both are sound
+  approximations that warn, and neither expresses a postcondition or a
+  knowledge claim. They remain useful as a first filter and are cited as the
+  baseline in the contrast section of the architecture document.
+* *Property-based testing only.* Rejected: PropEr and StreamData sample; they do
+  not quantify over all inputs, and a passing property is not a receipt.
+* *Concuerror as the protocol checker.* Rejected as the primary route: it
+  explores schedules within a bound and cannot state "the caller does not know
+  the replica committed". It is retained as a validation tool for the Apalache
+  counterexamples.
+* *Rust-only verification (Prusti/Creusot) for the NIF.* Rejected: the ABI and
+  the scheduler bound are Elixir/BEAM facts, and the estate's ZigProve receipts
+  already carry the memory obligations. Rustler glue is kept deliberately thin.
+* *One monolithic Coq development.* Rejected: it would re-derive the estate
+  libraries and lose the ability to pin them independently.
+
+=== References
+
+* link:../architecture/QUINTESSENCE.adoc[Quintessence: architecture and MVP roadmap]
+* link:../architecture/QUINTESSENCE-LAYER-A.adoc[Layer A]
+* link:../architecture/QUINTESSENCE-LAYER-B.adoc[Layer B]
+* link:../architecture/QUINTESSENCE-LAYER-C.adoc[Layer C]
+* link:../architecture/QUINTESSENCE-EVIDENCE.adoc[Evidence]
+* link:../status/QUINTESSENCE-ROADMAP.adoc[Roadmap]

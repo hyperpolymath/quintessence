@@ -1,0 +1,651 @@
+// SPDX-License-Identifier: CC-BY-SA-4.0
+// Copyright (c) 2026 Jonathan D.A. Jewell <j.d.a.jewell@open.ac.uk>
+= Quintessence Layer B: OTP, Cuts, and K-CUT
+:toc:
+:toc-placement: preamble
+:toc-title: Contents
+:doctype: article
+:revdate: 2026-10-22
+:revnumber: 0.1.0-draft
+
+This is the detailed design of Layer B: the mapping from OTP processes to graded
+choreographic types, the K-CUT obligations, the occupancy calculus, and the
+Apalache encoding. It assumes link:QUINTESSENCE.adoc[the main specification] and
+the pinned `choreographic-types` fragment recorded there.
+
+[IMPORTANT]
+====
+Reference design. The K-CUT theorems cited here are machine-checked in
+`choreographic-types` at the pinned revision, *for the fragment stated in that
+repository*. This document may not extend that fragment by assertion. Where a
+claim is outside it, the text says `OPEN` or `ASSUMED`.
+====
+
+== Scope and the proved fragment
+
+`choreographic-types` proves K-CUT for:
+
+* finite graded global types;
+* messages and *binary* choice;
+* endpoint projection with *plain merge* (a non-participant's two branches project
+  identically);
+* cuts as frontiers, with `Consistent` and `Projectable` side conditions;
+* a parametric resource algebra, with `Loss`, `MaxPlus`, and `HWM` instances;
+* an asynchronous layer where messages and selections may be in flight, with
+  causal cuts.
+
+It does **not** cover: recursion (mu-types), full merge, delegation, n-ary choice
+(a fold of binary is future work), queues-as-data, data-dependent warrants, or the
+general reply chain beyond the two-message protocol. Quintessence's MVP stays
+inside the fragment. A protocol outside it is `Q-402`, not silently approximated.
+
+The practical consequence for OTP: the MVP supports *linear request/reply
+protocols with a bounded number of roles*, optionally with binary choice, and
+without recursive protocols. That is enough for a commit/attest entity; it is not
+enough for a general session-typed server. Phase 4 extends the fragment in
+co-development with `choreographic-types`, not in quintessence alone.
+
+== Protocol syntax
+
+=== Global and local types
+
+[source,ebnf]
+----
+G ::= "end"
+    | p "->" q ":" l "{" G "}"          -- message
+    | G "." G                           -- sequence
+    | G "+" G                           -- binary choice
+    | "mu" X "." G | X                  -- recursion (OPEN, rejected in MVP)
+
+L ::= "end"
+    | "!" l "." L                       -- send
+    | "?" l "." L                       -- receive
+    | L "+" L                           -- choice
+    | "mu" X "." L | X                  -- recursion (OPEN)
+----
+
+A global type is a partial causal order. Projection `G ↾ p` gives the local type
+for role `p`. A *cut* is a downward-closed set of events; it is *consistent* for
+`p` when every event before the frontier that `p` can observe is included, and
+*projectable* when the truncated global type still projects. Both side conditions
+are load-bearing in the keystone: without `Projectable` the equality fails (1 vs
+2), and without `Consistent` it fails (1 vs 2) in the `choreographic-types`
+rejection tests.
+
+=== The Face form
+
+The Face's `@choreography` is a literal keyword list. It elaborates to a linear
+global type; binary choice is a future `choices:` key. Example:
+
+[source,elixir]
+----
+@choreography [
+  roles: [:client, :entity, :auditor],
+  messages: [
+    {:client, :entity, :commit, [:payload]},
+    {:entity, :client, :committed, [:version, :digest]},
+    {:entity, :auditor, :attest, [:version, :digest]}
+  ],
+  knowledge: [
+    {:client, :entity, :committed, [:version, :digest], {:call, :commit}},
+    {:auditor, :entity, :attest, [:version, :digest], {:cast, :attest}}
+  ],
+  forbid: [
+    {:entity, :knows, {:auditor, :received, :attest}, :cast}
+  ]
+]
+----
+
+The global type is:
+
+[source,text]
+----
+client -> entity : commit(payload) .
+entity -> client : committed(version, digest) .
+entity -> auditor : attest(version, digest)
+----
+
+The `client -> entity` message is a `call`; `entity -> client` is its reply. The
+`entity -> auditor` message is a `cast`. The protocol is linear, three roles, no
+choice, no recursion: inside the MVP fragment.
+
+== From GenServer callbacks to local types
+
+The mapping is static where possible and monitored where static checking is not
+sound.
+
+[cols="2,2,3",options="header"]
+|===
+| Callback | Local type | Static check
+
+| `handle_call({:commit, p}, from, s)` | `?commit . !committed . end` at `entity`
+| The clause pattern must match the declared message shape; the reply must be
+  `{:reply, {:ok, v, d}, s'}` or an error shape declared in the Face.
+
+| `handle_cast({:attest, v, d}, s)` | `?attest . end` at `auditor`
+| The clause must not reply; the `@post` must not mention a remote claim.
+
+| `handle_info(msg, s)` | any
+| A catch-all clause is required and must be proved to preserve `@invariant`;
+  an unhandled message is `Q-403`.
+
+| `init/1` | `end`
+| Establishes `@invariant`; no message may be sent before the state is valid.
+
+| `terminate/2` | `end`
+| Must not send a message that a knowledge claim depends on; termination is not
+  a commit.
+|===
+
+The static check is not enough on its own: a `handle_info` can receive a message
+that is not in the protocol, and a `GenServer.call` can time out. Two mechanisms
+close the gap:
+
+. *Callback coverage.* The protocol's labels are matched against the callback
+  clauses. Every declared message has exactly one handler; every handler's label
+  is declared. A missing handler is `Q-403`; an extra handler is allowed only if
+  it is a catch-all that logs/rejects and preserves the invariant.
+. *Runtime conformance monitor.* In test and staging, a `:sys`/`:erlang.trace`
+  based monitor records `send`, `receive`, `call`, and `cast` events and checks
+  them against the projected local type. A deviation is a test failure. This is
+  validation, not verification; it catches a Face that lies about the code.
+
+The monitor is important because the Face is an annotation. A developer can
+declare a `call` while the code uses `cast`; the static checker sees the
+annotation, not the call. The bytecode import audit and the runtime monitor are
+the two independent checks that the annotation matches the code. The import
+audit can see `GenServer.call/3` and `GenServer.cast/2`; the monitor sees the
+actual events.
+
+== Cuts, views, and knowledge
+
+=== Events and causality
+
+An event is one of:
+
+[source,text]
+----
+send(i, j, l, v)      -- i sends message l with payload v to j
+recv(i, j, l, v)      -- i receives it
+commit(i, s)          -- i's local state becomes s
+crash(i)              -- i stops
+restart(i, e)         -- i starts a new incarnation with epoch e
+----
+
+The causal order `->` is the transitive closure of:
+
+* program order at each process;
+* `send(i,j,l,v) -> recv(i,j,l,v)` for the same message instance;
+* `commit(i,s) -> send(i,j,l,v)` if the send is causally after the commit.
+
+A *cut* `k` is a downward-closed set of events. A cut is *consistent for i* when
+it does not include a receive whose send is outside the cut. The *view* of `i` at
+`k` is the sequence of `i`'s events in `k` plus the messages delivered to `i` in
+`k`:
+
+[source,text]
+----
+view_i(k) = <events at i in k> ++ <messages delivered to i in k>
+----
+
+Two worlds `w` and `w'` are *i-indistinguishable*, written `w ~_i w'`, when
+`view_i(w) = view_i(w')`. Knowledge is truth at every indistinguishable world:
+
+[source,text]
+----
+K_i(phi) at w  iff  forall w'. w ~_i w' => phi(w')
+----
+
+Knowledge is factive because `~_i` is reflexive. Belief would drop reflexivity;
+quintessence does not model belief in the MVP.
+
+=== K-CUT-LOSS
+
+Let `gamma` be an element of a resource algebra. `choreographic-types` proves,
+for every party `p` and consistent cut `c`:
+
+[source,text]
+----
+grade (G restricted to c) restricted to p
+  = lgrade (proj p G restricted to cutproj p c)
+----
+
+This is an equality, parametric in the algebra, using only `1 (x) x = x` and
+`x (+) x = x`. It holds synchronously and asynchronously (the receiver still
+waiting contributes the unit). The instances are `Loss`, `MaxPlus`, and `HWM`.
+
+Quintessence uses it three ways:
+
+. *Loss*: a party's view loses exactly the information the grade says it loses.
+   This justifies the knowledge bound: if the global loss grade is `l`, the
+   party's local grade is `l` restricted to its view.
+. *HWM*: the global occupancy grade restricted to a party is the party's local
+   mailbox high-water mark. This is the bridge from protocol occupancy to a
+   per-process mailbox bound. It is not a cost bound.
+. *MaxPlus*: the global cost grade restricted to a party is the party's local
+   cost. This is used for protocol-level timing, not for NIF WCET; see the
+   warning below.
+
+[WARNING]
+====
+`choreographic-types`' `MaxPlus` is an Agda instance. `tropical-types`' `MaxPlus`
+is a Lean formalization. They have the same laws and the same name, but the
+Lean-to-Agda bridge is explicitly open in `choreographic-types`' proof status.
+Quintessence MUST report them as two separate discharges. A Layer C NIF bound
+does not justify a Layer B grade without the bridge.
+====
+
+=== K-CUT-WARRANT
+
+The warrant component is a *bound*, not an equality. In the Kripke frame whose
+worlds are `p`-consistent cuts and whose accessibility is sameness of `p`'s view,
+`choreographic-types` proves:
+
+* `p` knows its own restricted grade at every world (`knows-own-grade`);
+* if every grade in `G` is above the unit, `grade restricted to p <= grade G`;
+* if every grade is below the unit, `grade G <= grade restricted to p`;
+* knowledge is monotone along the party-access preorder (`knows-mono`);
+* the local frontier is known (`knows-local-cut`).
+
+The direction of the bound depends on where the unit sits in the algebra's order.
+For `HWM` and `MaxPlus`, `p`'s view is a lower bound on the global grade; for
+`Loss`, it is an upper bound in the loss order. Any quintessence claim must say
+which direction it is using. A claim of the form "the global grade is exactly
+`p`'s grade" is false in general; it is the `GlobalGradeKnown` rejection test in
+`choreographic-types`.
+
+== The reply rule and the falsifier
+
+The pre-registered falsifier is the centre of Layer B. After an asynchronous
+send, the sender's view is consistent with two worlds: one where the message was
+delivered and one where it is still in flight (or lost). Therefore:
+
+[source,text]
+----
+send(i, j, m)  =>  not K_i(received_j(m))
+----
+
+`AsyncKnowledge.sender-cannot-know-receipt` proves this for the asynchronous
+frame; the synchronous frame has the dual `sync-sender-knows-receipt`. The
+receiver, by contrast, knows it was sent once it receives:
+`AsyncKnowledge.receiver-knows-sent`.
+
+A reply restores the sender's knowledge, but only for the two-message protocol
+`0 -> 1 : a . 1 -> 0 : b`:
+
+[source,text]
+----
+j committed s at v
+j sent reply(s, v, h) after the commit
+i received reply(s, v, h)
+h = H(s, v)
+epoch(reply) = epoch(j)
+-------------------------------------------------- K-REPLY
+K_i(committed_j(s, v))
+----
+
+The side conditions are load-bearing:
+
+* *After the commit*: a reply sent before the state transition is not a warrant.
+* *Authenticated*: an unauthenticated message can be forged; the frame assumes
+  an authenticated channel.
+* *Epoch match*: a reply from a previous incarnation is not a warrant for the
+  current one.
+* *No rollback*: the version is monotonic; a later reply with a lower version is
+  stale and rejected.
+
+The general reply chain (i sends to j, j sends to k, k replies to j, j replies to
+i) is **OPEN** in `choreographic-types`. Quintessence may not claim it. A
+three-message protocol is either decomposed into the two-message fragment (if the
+knowledge claim is local to a pair) or marked `assumed` with a visible receipt.
+
+=== Typing rules
+
+[source,text]
+----
+Gamma |- e : unit
+-------------------------------- K-SEND
+Gamma |- send(i,j,l,v) : K_i(sent(i,j,l,v)) ; not K_i(received_j(l,v))
+
+Gamma |- e : unit
+-------------------------------- K-CAST
+Gamma |- cast(i,j,l,v) : K_i(sent(i,j,l,v)) ; not K_i(received_j(l,v))
+
+Gamma |- e : T
+-------------------------------- K-RECV
+Gamma |- recv(i,j,l,x) : K_i(received(i,j,l,x)) ; x : T
+
+Gamma |- call(i,j,l,v) : reply r
+-------------------------------- K-CALL
+Gamma |- call(i,j,l,v) : K_i(received(r)) ;
+  (warrant(r) => K_i(committed_j(s, v)))
+
+Gamma |- monitor(i,j) : unit
+-------------------------------- K-MON
+Gamma |- monitor(i,j) : K_i(terminated(j, reason)) ; not K_i(state_j(s))
+
+Gamma |- restart(j, e+1) : unit
+-------------------------------- K-RESTART
+Gamma |- restart(j, e+1) : K_i(terminated(j, _)) ;
+  (durable_receipt(s, e) => K_i(state_j(s)))
+----
+
+`K-CALL` is the only rule that can introduce a remote commitment, and only when
+the reply carries a warrant. `K-SEND` and `K-CAST` are deliberately identical in
+their knowledge effect: send is not receipt, and cast is not a commit.
+
+== Enforcing the falsifier
+
+The Face's `@choreography` elaborator builds a derivation for each `knowledge`
+entry. The algorithm is a bounded proof search over the rules above:
+
+[source,text]
+----
+for each claim (knower, agent, fact, vars, channel):
+  if channel = {:call, label}:
+     require a reply message from agent to knower with the same label
+     require the reply payload vars to include the fact's vars
+     require the call to precede the reply in the global type
+     emit K-REPLY obligation
+  if channel = {:cast, label} or {:send, label}:
+     require knower = receiver(agent -> knower : label)
+     emit K-RECV obligation (receiver knows sent)
+     do NOT emit K-REPLY
+  if knower = sender and fact concerns the receiver's state:
+     reject Q-401
+  if the protocol is outside the fragment:
+     reject Q-402
+----
+
+The search is sound but incomplete: it may reject a valid claim it cannot derive
+(a false positive), but it never accepts a claim that the fragment does not
+warrant. That is the right direction for a verifier. A developer who believes a
+rejected claim is valid must either extend the protocol to a proved fragment
+(usually: add a reply) or mark the claim `assumed` with a receipt.
+
+`forbid` clauses are negative obligations. The checker attempts to derive the
+forbidden claim; if it succeeds, the module is rejected and the derivation is
+printed with the falsifier name. In the worked example, the forbidden claim
+`entity knows auditor received attest` is not derivable, so the module passes;
+if a future edit adds a knowledge entry with `{:cast, :attest}` from the entity's
+perspective, the derivation succeeds and the module fails.
+
+== Occupancy: the HWM calculus
+
+A mailbox is a queue with a high-water mark. The HWM grade is an occupancy grade,
+not a cost grade. The model has three layers:
+
+. *Protocol occupancy.* The global protocol's HWM grade at a cut; K-CUT-LOSS
+   projects it to each role. This gives a per-role bound in terms of the
+   protocol, independent of the implementation.
+. *Queue discipline.* The mailbox is a FIFO with selective receive. The checker
+   computes the arrival curve and the service curve for each pattern class.
+. *Operational reading.* `occupancy-types`' Session IR provides the linear
+   buffer/endpoint model and the HWM reading. Its HWM grade algebra is planned
+   (R2-R3); the Agda HWM instance in `choreographic-types` is the algebra used for
+   K-CUT.
+
+=== Arrival and service bounds
+
+For a mailbox with burst `b`, arrival rate `lambda`, and worst-case handler
+service `W`, the backlog bound is:
+
+[source,text]
+----
+if lambda < 1 / W:
+    HWM <= b + lambda * W / (1 - lambda * W)
+else:
+    HWM is unbounded; reject (Q-404)
+----
+
+The simpler bound `HWM <= b + lambda * W` is used in the MVP; it is conservative
+and easy to check in linear arithmetic. `W` comes from Layer C's `MaxPlus` bound
+for the handler's NIFs plus the pure handler cost; `lambda` and `b` come from the
+Face's `@arrival` annotation or from a measured trace. A measured trace is not a
+proof for all executions; the receipt records `arrival: measured` and the bound is
+labelled `BOUNDED`.
+
+=== Selective receive
+
+`receive` scans the mailbox from the front and removes the first message that
+matches any clause. Messages that do not match stay. The cost is O(n) per scan,
+and a class that is never matched can starve. The checker models each pattern
+class as a separate queue:
+
+[source,text]
+----
+class P1: arrival lambda1, service mu1
+class P2: arrival lambda2, service mu2
+...
+starvation(Pi) iff lambda_i >= mu_i
+----
+
+A `receive` with an `after` timeout is not a fix: the timeout branch is a
+protocol event, and the spec must say what happens to the unmatched message. A
+catch-all clause that drops messages is allowed only if the protocol's loss grade
+says the drop is permitted; otherwise it is `Q-404`.
+
+=== Backpressure
+
+If the bound cannot be proved, the module MUST declare backpressure:
+
+* a bounded internal queue with `handle_continue` and a `{:noreply, ...}` that
+  refuses new work when full;
+* a synchronous `GenServer.call` handshake that blocks the producer;
+* a supervisor-level rate limit with a proved arrival curve.
+
+`GenServer.cast` alone is unbounded by construction. `:max_heap_size` bounds the
+process heap, not the mailbox. A `:busy_port` or `:fullsweep_after` setting is not
+a backpressure proof.
+
+== Crashes, links, and supervision
+
+A crash truncates the cut. The state is gone; in-flight messages to the crashed
+process are lost; messages it sent remain. A restart creates a new incarnation
+with a new epoch.
+
+[cols="2,3,3",options="header"]
+|===
+| Event | Knowledge | Invariant obligation
+
+| `monitor` / `:DOWN` | `K_i(terminated(j, reason))`; not `K_i(state_j(s))`
+| The monitor's post-state must not depend on the target's state.
+
+| `link` / exit signal | If trapping, `K_i(exit(j, reason))`; if not, `i` may die
+| The supervisor's strategy must be modeled; an unhandled exit is a crash.
+
+| `one_for_one` restart | New epoch; old knowledge is stale
+| `init/1` re-establishes `@invariant`; a claim about the old state requires a
+  durable receipt.
+
+| `rest_for_one` / `one_for_all` | Global cut; all children restart
+| The invariant must be inductive over the restart, not just over normal
+  transitions.
+
+| `max_restarts` escalation | Subtree termination
+| The spec must state whether termination is permitted; it is not silently
+  ignored.
+|===
+
+`ProofTransport` is the certificate that carries a proof across a restart. It
+has two parts: a *durable state receipt* (the new incarnation's state hash and
+epoch) and a *re-establishment proof* (the invariant holds for `init/1` and the
+new state). Without both, a claim that mentions the old process's state is
+`Q-401` after a restart.
+
+== Apalache encoding
+
+The TLA+ model is an abstraction of the protocol, not of the Elixir code. It has
+finite roles, finite values, bounded mailboxes, and bounded epochs.
+
+[source,tlaplus]
+----
+--------------------------- MODULE QuintessenceKCut ---------------------------
+EXTENDS Naturals, Sequences, FiniteSets
+
+CONSTANTS Roles, Values, MaxMailbox, MaxEpochs
+
+VARIABLES state, mailbox, inflight, view, epoch, committed, knowledge
+
+vars == <<state, mailbox, inflight, view, epoch, committed, knowledge>>
+
+Init ==
+    /\ state     = [r \in Roles |-> "init"]
+    /\ mailbox   = [r \in Roles |-> <<>>]
+    /\ inflight  = {}
+    /\ view      = [r \in Roles |-> <<>>]
+    /\ epoch     = [r \in Roles |-> 0]
+    /\ committed = [r \in Roles |-> {}]
+    /\ knowledge = [r \in Roles |-> {}]
+
+Send(i, j, m) ==
+    /\ i # j
+    /\ Len(mailbox[j]) < MaxMailbox
+    /\ mailbox'   = [mailbox EXCEPT ![j] = Append(@, m)]
+    /\ inflight'  = inflight \cup {<<i, j, m>>}
+    /\ UNCHANGED <<state, view, epoch, committed, knowledge>>
+
+Deliver(j, m) ==
+    /\ m \in {x \in inflight : x[2] = j}
+    /\ mailbox'  = [mailbox EXCEPT ![j] = Tail(@)]
+    /\ view'     = [view EXCEPT ![j] = Append(@, m[3])]
+    /\ inflight' = inflight \ {m}
+    /\ UNCHANGED <<state, epoch, committed, knowledge>>
+
+Commit(j, v) ==
+    /\ state'     = [state EXCEPT ![j] = v]
+    /\ committed' = [committed EXCEPT ![j] = @ \cup {v}]
+    /\ UNCHANGED <<mailbox, inflight, view, epoch, knowledge>>
+
+Crash(j) ==
+    /\ mailbox'   = [mailbox EXCEPT ![j] = <<>>]
+    /\ inflight'  = {x \in inflight : x[1] # j}
+    /\ epoch'     = [epoch EXCEPT ![j] = @ + 1]
+    /\ UNCHANGED <<state, view, committed, knowledge>>
+
+Know(r, f) ==
+    /\ f \in knowledge[r]
+    /\ UNCHANGED vars
+
+MailboxBound ==
+    \A r \in Roles : Len(mailbox[r]) <= MaxMailbox
+
+NoUnwarrantedRemoteClaim ==
+    \A r \in Roles, f \in knowledge[r] :
+        RemoteCommit(f) => HasWarrant(r, f)
+
+EpochConsistent ==
+    \A r \in Roles : epoch[r] <= MaxEpochs
+================================================================
+----
+
+`HasWarrant` is defined in the concrete instance: it checks that `view[r]`
+contains a reply message for `f` with the same epoch and a version at least as
+large. `RemoteCommit(f)` is a predicate over the fact's shape.
+
+Apalache runs:
+
+[source,bash]
+----
+apalache-mc check \
+  --length=12 \
+  --cinit=ConstInit \
+  --inv=MailboxBound \
+  --inv=NoUnwarrantedRemoteClaim \
+  --inv=EpochConsistent \
+  QuintessenceKCut.tla
+----
+
+The instance fixes `Roles = {c, e, a}`, `Values = {0, 1}`, `MaxMailbox = 2`,
+`MaxEpochs = 1`. Increasing the bounds increases the state space; the MVP's CI
+runs the small instance on every PR and a larger one nightly.
+
+=== What Apalache proves, and what it does not
+
+* It proves that no execution of the *model* up to length 12 reaches a state
+  violating the invariants. That is `BOUNDED`.
+* It does not prove the model refines the Elixir code. The refinement is the
+  Face's static mapping plus the runtime monitor; the formal refinement
+  obligation is Phase 5.
+* It does not prove the model refines the Agda K-CUT semantics. The encoding is
+  validated by trace tests and reviewed; a mechanized refinement is a research
+  item.
+* It does not prove liveness. The MVP uses safety invariants; fairness is an
+  assumption for eventual delivery, not a checked property.
+
+The honest label in the receipt is `apalache: bounded(12, MaxMailbox=2,
+MaxEpochs=1)`, not "protocol proved".
+
+== Composition theorem
+
+[source,text]
+----
+Theorem (Layer composition, target statement).
+Assume:
+  (A) every Layer A handler satisfies its pre/post/invariant contract;
+  (B) the protocol is well-typed in the proved K-CUT fragment, every knowledge
+      claim has a K-REPLY/K-RECV warrant, and every forbidden claim is underivable;
+  (C) the mailbox HWM bound is proved from the protocol grade and the service
+      bound, or backpressure is present;
+  (D) every NIF receipt is valid and its MaxPlus bound is within budget;
+  (E) channels are authenticated, the system is crash-stop (no Byzantine faults),
+      and the scheduler is fair.
+Then:
+  (1) no reachable state violates the module invariant;
+  (2) no actor makes an unwarranted remote claim.
+----
+
+Proof sketch. Induct over cuts. At the empty cut, `init/1` establishes the
+invariant (A). For a normal transition, Layer A gives the local state change and
+preserves the invariant; K-CUT gives projection and the knowledge bound; the
+occupancy bound gives the mailbox invariant; Layer C gives the native refinement
+for any NIF call. For a crash, the cut is truncated; the invariant is
+re-established by `init/1` on restart, or the subtree terminates and the
+invariant is vacuous for that subtree. For a knowledge claim, the only
+introduction rule for a remote commitment is K-REPLY; K-SEND and K-CAST cannot
+introduce it, so the falsifier is respected. The composition of the layer
+theorems is the induction step.
+
+The proof is **not** machine-checked as a whole in the MVP. The K-CUT metatheory
+is; the Layer A VCs are; the Layer C receipts are. The composition is a paper
+argument with a named obligation. Phase 5 formalizes it in Agda, with the
+composition as a theorem over the layer interfaces.
+
+== Validation strategy
+
+. *Trace conformance.* Run the app under the runtime monitor; every event must
+   match the projected local type. A deviation is a test failure.
+. *Apalache counterexamples.* A counterexample is replayed in the Elixir app; if
+   it cannot be reproduced, the abstraction is wrong and must be fixed before the
+   model is trusted.
+. *Concuerror cross-check.* The same protocol is run under Concuerror with a
+   small message bound; its schedules should be a subset of the TLA+ model's
+   traces. A schedule the model does not allow is a modeling bug.
+. *Mutation.* ECHIDNA mutates `call` to `cast`, drops replies, reorders messages,
+   and restarts processes. A surviving protocol mutant is a missing K-CUT
+   obligation or an unreachable `forbid`.
+. *Mailbox measurement.* The HWM bound is compared with a production measurement
+   over a representative workload. A measurement above the bound is a
+   stop-and-ledger event: either the arrival curve is wrong or the bound is not a
+   bound.
+
+== Open issues
+
+* *General reply chain.* The two-message theorem is the only receipt-grade reply
+  claim. A three-message chain needs the `choreographic-types` extension.
+* *Recursion.* `mu`-types are outside the fragment. Stateful protocols with
+  loops are modeled as bounded unrollings, labelled `BOUNDED`.
+* *Full merge.* Only plain merge. A protocol where a non-participant
+  distinguishes branches is outside the fragment.
+* *Delegation.* Not modeled; a process cannot hand its endpoint to another.
+* *Data-dependent warrants.* The frame carries what the type determines; a
+  digest-dependent claim is Layer A/C, not K-CUT.
+* *Distribution.* Node partitions, `noconnection`, and message loss across nodes
+  are Phase 4. The async cut model is there; the OTP mapping is not.
+* *Timers.* `GenServer` timeouts and `Process.send_after` are protocol events;
+  the MVP models them as uninterpreted events with a fairness assumption.
+* *Dynamic supervisors.* `DynamicSupervisor`/`simple_one_for_one` create roles at
+  runtime, outside the finite-role model.
+* *Runtime conformance.* The monitor is a test oracle, not a proof. A production
+  monitor could enforce the protocol at runtime, but that is a different
+  product.
