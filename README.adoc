@@ -1,172 +1,168 @@
 // SPDX-License-Identifier: CC-BY-SA-4.0
-// Copyright (c) Jonathan D.A. Jewell <j.d.a.jewell@open.ac.uk>
-// SPDX-FileCopyrightText: 2024-2026 Jonathan D.A. Jewell (hyperpolymath)
-= {{PROJECT_NAME}}
+// Copyright (c) 2026 Jonathan D.A. Jewell <j.d.a.jewell@open.ac.uk>
+= Quintessence
 :toc:
 :toc-placement: preamble
+:toc-title: Contents
+:doctype: article
 
 // ── Licensing ───────────────────────────────────────────────────────────────
 image:https://img.shields.io/badge/Code-MPL--2.0-blue.svg?logo=mozilla[Code licence: MPL-2.0,link="https://opensource.org/licenses/MPL-2.0"]
 image:https://img.shields.io/badge/Docs-CC--BY--SA--4.0-blue.svg?logo=creativecommons[Docs licence: CC-BY-SA-4.0,link="https://creativecommons.org/licenses/by-sa/4.0/"]
-image:https://img.shields.io/badge/Provenance-Quantum--Safe-blueviolet[Quantum-Safe Provenance,link="docs/legal/EXHIBIT-B-QUANTUM-SAFE.txt"]
-
-// ── Standard & quality gates ────────────────────────────────────────────────
 image:https://img.shields.io/badge/RSR-Rhodium_Standard-9C27B0[Rhodium Standard Repository,link="https://github.com/hyperpolymath/rhodium-standard-repositories"]
-image:https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/{{OWNER}}/{{REPO}}/governance-badges/badges/k9.json[K9 conformance,link="https://github.com/{{OWNER}}/{{REPO}}/actions/workflows/dogfood-gate.yml"]
-image:https://www.bestpractices.dev/projects/{{OPENSSF_BP_ID}}/badge[OpenSSF Best Practices,link="https://www.bestpractices.dev/projects/{{OPENSSF_BP_ID}}"]
-image:https://api.scorecard.dev/projects/github.com/{{OWNER}}/{{REPO}}/badge[OpenSSF Scorecard,link="https://scorecard.dev/viewer/?uri=github.com/{{OWNER}}/{{REPO}}"]
-image:https://sonarcloud.io/api/project_badges/measure?project={{OWNER}}_{{REPO}}&metric=alert_status[SonarQube Quality Gate,link="https://sonarcloud.io/summary/new_code?id={{OWNER}}_{{REPO}}"]
-image:https://archive.softwareheritage.org/badge/origin/https://{{FORGE}}/{{OWNER}}/{{REPO}}/[Archived in Software Heritage,link="https://archive.softwareheritage.org/browse/origin/?origin_url=https://{{FORGE}}/{{OWNER}}/{{REPO}}"]
 
-// ── Provenance & ecosystem ──────────────────────────────────────────────────
-image:https://img.shields.io/badge/Idris-Inside-5E5086?logo=idris&logoColor=white[Idris Inside,link="https://github.com/hyperpolymath/proven"]
-image:https://img.shields.io/badge/Zig-Zero--overhead-F7A41D?logo=zig&logoColor=black[Zig Zero-overhead FFI,link="https://github.com/hyperpolymath/typed-wasm"]
-image:https://api.thegreenwebfoundation.org/greencheckimage/{{FORGE}}[Green Web,link="https://www.thegreenwebfoundation.org/green-web-check/?url={{FORGE}}"]
+_Verification for the part of Elixir/OTP that can carry a proof._
 
-{{PROJECT_DESCRIPTION}}
+*Repository description:* Three-layer formal verification suite for Elixir/OTP/BEAM:
+sequential pure subsets with TINI + MPR R5 non-interference, choreographic K-CUT
+GenServer protocols, and Idris2 QTT ABI + verified Zig NIFs under MaxPlus 1 ms
+scheduler bounds, backed by Z3, CVC5, Alethe proof checking, and ECHIDNA
+mutation gates.
+
+*Topics (20):* `hyperpolymath` · `open-source` · `epistemic-computing` ·
+`epistemic-infrastructure` · `equivalence-aware-computing` · `typed-provenance` ·
+`veridical-computing` · `formal-verification` · `elixir` · `beam` · `otp` ·
+`zig` · `idris2` · `smt-solving` · `proof-certificates` ·
+`choreographic-programming` · `session-types` · `noninterference` ·
+`max-plus-algebra` · `maximum-principal-reduction`
+
+Quintessence is a three-layer formal verification suite for Elixir/OTP. It proves
+three properties the standard BEAM toolchain does not:
+
+. *Layer A (Sequential subset)* — pure functions satisfy their `@pre`/`@post`
+  contracts for *all* valid inputs, terminate along an explicit `@measure`, and
+  preserve `secret-types` lattice TINI non-interference.
+. *Layer B (OTP / GenServer protocol layer)* — processes claim remote state
+  commitment *only* across proved two-party `K-REPLY` causal round-trips
+  (`choreographic-types` Y-6/Y-8), never across asynchronous `cast`/`send`,
+  under bounded mailbox occupancy and supervision epoch restarts (`k = 12` BMC).
+. *Layer C (Native NIF boundary)* — Zig/Rustler NIFs satisfy C1--C12 safety
+  obligations, match their reproducible binary SHA-256 receipt at load time, and
+  satisfy `MaxPlus <= 1,000 us` for normal BEAM schedulers (or declare
+  `schedule: :dirty_cpu`).
 
 [IMPORTANT]
 ====
-*This file is a template.* You are reading `README.adoc` from the *RSR template repo*
-(or a freshly-cloned copy of it). Run `just repo-init` to replace every `{{PLACEHOLDER}}`
-token with your project's details, then delete this admonition. Until you do, the
-`{{...}}` markers below are intentional placeholders, not content.
+*Current implementation state (`v0.1.0-alpha` vertical slice):* The native Zig
+compiler/verifier (`src/core/` + `src/interface/ffi/`), dual Z3 5.3.1 + CVC5
+1.4.2 SMT & Alethe proof-DAG kernel checker, `k = 12` symbolic BMC engine,
+Layer C `MaxPlus` / `dlopen` / SHA-256 receipt verifier, 6-kind ECHIDNA mutation
+engine, Elixir Mix frontend (`mix.exs`, `lib/`), and 15-case live regression
+suite (`tests/quintessence/run_suite.sh`) *compile and execute today*, producing
+honest `TrustLevel 4` local certificates. Batch `coqc` + `lean` `TrustLevel 5`
+promotion and `beam_lib` bytecode tracing are scheduled in Milestones M1--M5 of
+link:docs/architecture/QUINTESSENCE-IMPLEMENTATION-PLAN.adoc[the Implementation Plan].
 ====
 
-== What this is
+== The pipeline
 
-A new repository scaffolded from the *Rhodium Standard Repository (RSR)* template:
-a batteries-included starting point that ships with CI/CD, machine-readable project
-metadata, an AI-agent gatekeeper protocol, a formally-typed ABI/FFI seam
-(Idris2 + Zig), container and reproducible-build scaffolding, and governance
-infrastructure — all wired and passing the RSR validators on day one.
+[source,text]
+----
+Elixir source
+  |  G0  deterministic macro & purity firewall (`Q-101`..`Q-108`, `Q-206`)
+  v
+  |  G1  subset checker + Face elaborator
+  v
+Core Spec IR  (`qir/v1`, RFC 8785 JCS content-addressed, Idris2 QTT model)
+  |------------------+-------------------+-------------------+
+  v                  v                   v
+Layer A            Layer B             Layer C
+QF_UFLIA / QF_BV   K-CUT + k=12 BMC    Idris2 ABI / Zig C1-C12 / MaxPlus
+  |                  |                   |
+  +---------+--------+---------+---------+
+            v
+   Z3 + CVC5 + Native Alethe Proof-DAG Kernel  ->  6-Kind Mutation (>= 95%)
+            v
+   TrustLevel 4 Warrant/Receipt  ->  batch Coq + Lean  ->  Level 5 Receipt
+----
 
-Replace this section with a description of *your* project once initialised.
+== What exists in this repository
+
+[cols="1,3",options="header"]
+|===
+| Path | Contents
+
+| link:docs/architecture/QUINTESSENCE-IMPLEMENTATION-PLAN.adoc[Implementation Plan]
+| Engineering execution blueprint, `v0.1.0-alpha` reality audit, pass-by-pass
+  design, empirical solver/ELF findings, and Milestones M1--M5 to `v1.0.0`.
+
+| link:docs/architecture/QUINTESSENCE.adoc[Architecture]
+| Full architectural specification: pipeline, `qir/v1`, Layers A/B/C, evidence,
+  `mix verify`, risks, traceability, foundations, and error catalogue.
+
+| link:docs/architecture/QUINTESSENCE-LAYER-A.adoc[Layer A]
+| Sequential subset grammar, refinements, typing rules, Why3/SMT projection,
+  TINI non-interference, and G0a--G0c firewall.
+
+| link:docs/architecture/QUINTESSENCE-LAYER-B.adoc[Layer B]
+| Proved two-party fragment, GenServer Face, `K-CUT-LOSS`/`WARRANT`, `K-REPLY`,
+  mailbox high-water-mark calculus, supervision epochs, and TLA+ model.
+
+| link:docs/architecture/QUINTESSENCE-LAYER-C.adoc[Layer C]
+| Idris2 QTT ABI, Rustler rules, alloc-free Zig core, C1--C12 receipt schema,
+  and tropical `MaxPlus` BEAM scheduler timeslice law.
+
+| link:docs/architecture/QUINTESSENCE-EVIDENCE.adoc[Evidence]
+| Warrant/Receipt JCS schemas, trust ladder, ECHIDNA dispatch, Alethe/Dedukti
+  certificates, vacuity V1--V5, and 6-kind mutation scoring.
+
+| link:docs/status/QUINTESSENCE-ROADMAP.adoc[Roadmap]
+| Phased roadmap (Phases 0--6), WP-01..WP-27 work breakdown, gates, and metrics.
+
+| `src/core/`, `src/interface/`
+| Native Zig 0.17 verifier engine (`quintessence` CLI + `libquintessence.so`)
+  and `%default total` Idris2 QTT ABI (`src/interface/Abi/Qir.idr`).
+
+| `mix.exs`, `lib/`
+| Elixir package (`Quintessence`, `Quintessence.Face`, `Quintessence.Nif`,
+  `Quintessence.Tracer`, and `mix verify` / `doctor` / `explain` / `receipt`).
+
+| link:examples/quintessence/README.adoc[Worked example]
+| `Verisim.Spec`, `Verisim.Entity`, `Verisim.Nif`, `verisim_nif.zig`, JCS NIF
+  receipt, Idris2 model, and TLA+ protocol model — verified end to end (12 QEDs,
+  25,910 Alethe steps, 100.00% mutation score).
+|===
+
+Architectural rationale is recorded in
+link:docs/decisions/0004-three-layer-architecture.adoc[ADR-0004].
 
 == Quick start
 
 [source,bash]
 ----
-# 1. Create a repo from this template (or clone it), then from the repo root:
-just repo-init                # interactive bootstrap: fills every {{PLACEHOLDER}}
-
-# 2. See the available tasks:
-just                     # lists all phases (build, test, validate, audit, ...)
-
-# 3. Check the repo still satisfies the RSR shape:
-just validate            # structure + metadata checks
+just build                                                       # build libquintessence.so + CLI
+./src/interface/ffi/zig-out/bin/quintessence doctor              # check Z3, CVC5, Zig, Alethe kernel
+./src/interface/ffi/zig-out/bin/quintessence verify examples/quintessence
+just test                                                        # 10 Zig unit tests + 15 E2E cases
+just validate                                                    # RSR structure, deed, AI guide
 ----
 
-`just repo-init` prompts for the project name, owner, author, licence contact, and the
-other values listed in `.machine_readable/ai/PLACEHOLDERS.adoc`, substitutes them
-across the tree, validates the result, and (if available) runs the `k9-svc` checks.
+When Elixir/Mix is installed alongside the native binary:
+
+[source,bash]
+----
+mix quintessence.doctor
+mix verify examples/quintessence --strict
+mix quintessence.explain Q-401
+----
 
 [[ai-install]]
-== AI-Assisted Installation (Recommended)
+== AI-Assisted Installation
 
-=== Just say it
-
-Say this to any AI assistant that can read a URL and run commands (or give you
-commands to paste):
-
-[source,text]
-----
-Create a new repository from https://github.com/hyperpolymath/rsr-template-repo
-----
-
-The URL is the key: it leads the assistant to
-link:docs/AI_INSTALLATION_GUIDE.adoc[`docs/AI_INSTALLATION_GUIDE.adoc`], the
-complete step-by-step recipe. The assistant checks your system, installs the
-prerequisites, instantiates the template with `just repo-init`, and verifies the
-result with `just doctor`.
-
-* "Set up rsr-template-repo so I can work on the template itself — https://github.com/hyperpolymath/rsr-template-repo"
-* `./launcher.sh --ai-setup` (or `just ai-setup`) prints the line and the guide path.
-
-=== What you will be asked
-
-. Your operating system (Linux, macOS, or Windows via WSL2).
-. The new project's name, owner, author and licence contact (the values listed in
-  `.machine_readable/ai/PLACEHOLDERS.adoc`).
-. To confirm the privacy notice below.
-
-=== Privacy and security
-
-[IMPORTANT]
-====
-Setting up rsr-template-repo clones this repository and installs its developer
-tools per-user with mise (no administrator rights, nothing sent anywhere).
-`just repo-init` rewrites files only inside the new checkout; it creates no
-remote repository and pushes nothing until you do.
-====
-
-=== Minting without a terminal
-
-Agents and CI can mint non-interactively: set `RSR_NON_INTERACTIVE=1` and pass
-the answers as environment variables named like the prompts' variables in
-`build/just/repo-init.just` (`PROJECT_NAME`, `REPO`, `OWNER`, `AUTHOR` and
-`AUTHOR_EMAIL` are required; any other answer left unset is blank or takes its
-default). Piping the answers to stdin in prompt order also works.
-
-=== Troubleshooting
-
-Run `just doctor`; each FAIL carries a code explained in
-link:docs/SETUP.adoc#troubleshooting[`docs/SETUP.adoc` §Troubleshooting], and
-`just heal` applies the automatic fixes. Prefer to do it yourself? The full
-manual route is link:docs/SETUP.adoc[`docs/SETUP.adoc`]; developers and
-maintainers can brief an AI with `just ai-warmup dev` / `just ai-warmup maintainer`.
-
-== What you get
-
-* *Machine-readable metadata* (`.machine_readable/descriptiles/`) — `STATE`, `META`,
-  `ECOSYSTEM`, `PLAYBOOK`, `AGENTIC`, `NEUROSYM`, `CLADE`, and `anchors/ANCHOR`,
-  in deed, so tools and agents can read the project's state and boundaries.
-* *AI gatekeeper protocol* — `rsr-template-repo_chora.deed` (the repo deed) is the
-  universal entry point that tells an AI agent how to work in this repo before it
-  touches anything; it carries the AI allocation policy and the ply directory tree.
-* *Typed ABI/FFI seam* — `src/interface/Abi/` (Idris2 type + layout proofs) over
-  `src/interface/ffi/` (Zig implementation), with generated C headers.
-* *CI/CD* — GitHub Actions for quality, security (CodeQL, Scorecard, secret
-  scanning), multi-forge mirroring, and RSR anti-pattern enforcement.
-* *Supply-chain & reproducibility* — container layering (stapeln), Guix shells,
-  SBOM, and signing hooks.
-* *Governance* — `GOVERNANCE.adoc`, `MAINTAINERS.adoc`, `.github/` community health
-  files, and a release `AUDIT.adoc` gate.
-
-== Repository map
-
-The authoritative map is generated, so it cannot drift from the tree:
-link:docs/architecture/REPOSITORY-MAP.adoc[docs/architecture/REPOSITORY-MAP.adoc]
-(regenerate with `just repo-map`; CI fails if it is stale).
-
-The short version:
-
-[cols="1,3"]
-|===
-| Path | What lives there
-
-| `README.adoc`, `CLAUDE.md` | Start here - humans and AI agents respectively.
-| `src/`, `tests/`           | The code and its tests.
-| `docs/`                    | Human documentation, including the full map above.
-| `.machine_readable/`        | Manifests, contractiles and policies that tools read.
-| `build/`, `Justfile`       | Every task runs through `just`; phases live in `build/just/`.
-| `ci/`, `.github/`          | CI configuration; GitHub reads `.github/` and no other path.
-|===
-
-== Where to go next
-
-* link:docs/architecture/REPOSITORY-MAP.adoc[The repository map] — generated; what every directory is for.
-* link:docs/EXPLAINME.adoc[EXPLAINME] — the engineering deep-dive: how the pieces actually work.
-* link:docs/AFFIRMATION.adoc[AFFIRMATION] — the dated, signed honesty snapshot of the repo's true state.
-* link:docs/AUDIT.adoc[AUDIT] — the release audit gate.
-* link:docs/AI_INSTALLATION_GUIDE.adoc[AI installation guide] — for agents instantiating this template.
-* link:.machine_readable/ai/PLACEHOLDERS.adoc[PLACEHOLDERS] — the full placeholder reference.
+For AI agents working in or extending this repository: read
+`quintessence_chora.deed`, `CLAUDE.md`, and `docs/status/ROADMAP.adoc` first,
+then follow link:docs/AI_INSTALLATION_GUIDE.adoc[docs/AI_INSTALLATION_GUIDE.adoc]
+and link:docs/architecture/REPOSITORY-MAP.adoc[docs/architecture/REPOSITORY-MAP.adoc].
 
 == Licence
 
-Code, configuration and scripts are link:LICENSE[Mozilla Public License 2.0]
-(`MPL-2.0`); prose documentation is `CC-BY-SA-4.0`. Both texts live in
-`LICENSES/`, and per-file `SPDX-License-Identifier` headers are authoritative.
-The GitHub-detected licence is MPL-2.0 (the root `LICENSE`). Long-term
-attribution uses Quantum-Safe Provenance — see
-link:docs/legal/EXHIBIT-B-QUANTUM-SAFE.txt[the Quantum-Safe Provenance exhibit].
+Code is link:LICENSE[Mozilla Public License 2.0] (`MPL-2.0`); documentation and
+prose are `CC-BY-SA-4.0`. Every file carries an explicit `SPDX-License-Identifier`
+header.
+
+== Provenance
+
+Minted from `hyperpolymath/rsr-template-repo` under RSR canon v2.1.2 (`fv` clade:
+*Formal Verification & Proofs*). Builds on the estate's upstream foundations
+(`choreographic-types`, `secret-types`, `epistemic-types`, `tropical-types`,
+`occupancy-types`, and `echidna`).

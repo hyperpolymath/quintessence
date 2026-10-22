@@ -28,6 +28,10 @@
 # Usage: bash tests/e2e/use_template_mint_test.sh [--keep]
 set -euo pipefail
 repo=$(git rev-parse --show-toplevel)
+if [ ! -d "$repo/archetypes" ]; then
+    echo "SKIP: no archetypes/ here, so this is a minted repo; its provenance is checked by check-template-conformance.sh"
+    exit 0
+fi
 work=$(mktemp -d)
 if [ "${1:-}" = "--keep" ]; then echo "keeping $work"; else trap 'rm -rf "$work"' EXIT; fi
 

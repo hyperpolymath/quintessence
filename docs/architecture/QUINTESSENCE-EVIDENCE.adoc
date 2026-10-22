@@ -1,0 +1,612 @@
+// SPDX-License-Identifier: CC-BY-SA-4.0
+// Copyright (c) 2026 Jonathan D.A. Jewell <j.d.a.jewell@open.ac.uk>
+= Quintessence Evidence: Warrants, Receipts, and Vacuity
+:toc:
+:toc-placement: preamble
+:toc-title: Contents
+:doctype: article
+:revdate: 2026-10-22
+:revnumber: 0.1.0-draft
+
+This document defines the evidence objects, the ECHIDNA integration, the
+Why3/Dedukti route, and the mutation/vacuity gate. It assumes
+link:QUINTESSENCE.adoc[the main specification].
+
+[IMPORTANT]
+====
+Reference design. ECHIDNA's public Rust surface (`TrustLevel`,
+`ProofCertificate`, `MutationTester`, `MutationKind`) is real and cited from the
+repository; the quintessence adapter around it is designed here, not implemented.
+====
+
+== Two objects, one ladder
+
+Quintessence has exactly two evidence objects:
+
+* a *Warrant*: a local, content-addressed claim that a goal was discharged by a
+  named route. It is `incomplete` until the batch stage checks it.
+* a *Receipt*: a batch-checked Warrant whose obligations have the required
+  independent checkers and whose axiom set is acceptable.
+
+The ladder is not a single number. A Warrant records `status`, `trust_level`,
+`route`, `assumptions`, and `artifacts`. A Receipt records the same plus the
+batch checks. The gate consults a policy table that says which checkers are
+required for which obligation class.
+
+[cols="1,3,3",options="header"]
+|===
+| Status | Meaning | Can it ship?
+
+| `refuted`
+| A counterexample was found, or a kernel rejected the proof.
+| Never. Hard failure.
+
+| `vacuous`
+| The specification is unsatisfiable or trivial (V1/V2/V4).
+| Never. Hard failure.
+
+| `unknown`
+| Solver timeout, incomplete theory, or no answer.
+| No. It may be retried; it is not a pass.
+
+| `unsupported`
+| The obligation is outside the tool's fragment.
+| No. Rewrite, narrow, or mark `assumed` with a visible receipt.
+
+| `unchecked`
+| An SMT oracle said `unsat`, but no proof artifact exists.
+| Only in `--allow-oracle` mode; never a Receipt.
+
+| `incomplete`
+| A local kernel checked the artifact, but the batch cross-check is missing.
+| Local development; not a release.
+
+| `complete`
+| Every required checker for the obligation class is present and QED.
+| Yes, according to the policy table.
+|===
+
+=== Trust levels
+
+ECHIDNA's `TrustLevel` is the ordering; quintessence does not invent a parallel
+scale.
+
+[cols="1,4,3",options="header"]
+|===
+| Level | ECHIDNA meaning | Quintessence policy
+
+| 1
+| Minimal: large TCB, unchecked, or dangerous axioms.
+| Never accepted.
+
+| 2
+| Basic: single prover, no dangerous axioms.
+| Advisory only; cannot satisfy a NIF, K-CUT, or release gate.
+
+| 3
+| Moderate: single prover with a proof certificate.
+| Local Warrant; development only.
+
+| 4
+| High: small-kernel prover with a certificate.
+| Ordinary Layer A may ship; Layer B instance may ship with the pinned
+  metatheory; Layer C memory may ship with ZigProve + binary hash.
+
+| 5
+| Maximum: cross-checked by two or more small-kernel systems.
+| Required for `@trusted`, release NIFs, and the Layer A/C release gate. For
+  Layer B, Level 5 means the *instance* is cross-checked in Coq and Lean; the
+  K-CUT metatheory remains Agda (see below).
+|===
+
+The last row is the honest part. `choreographic-types` is an Agda development.
+Coq and Lean cannot import its proofs. A Layer B Receipt therefore has two
+components:
+
+. *Metatheory*: Agda checks the instance against the pinned K-CUT library. This
+   is a single small kernel (Agda) and is Level 4 by ECHIDNA's definition.
+. *Instance*: Coq and Lean independently check the finite protocol's invariant
+   by exhaustive case analysis. This is a second and third kernel for the
+   *instance*, not for K-CUT. If both QED, the instance is Level 5; the
+   metatheory is still Agda.
+
+The receipt says exactly that: `metatheory: agda@pin`, `instance: [coq, lean]`.
+It does not say "K-CUT proved in Coq and Lean". That would be false.
+
+== Warrant schema
+
+[source,json]
+----
+{
+  "schema": "quintessence.warrant/v1",
+  "id": "sha256:6f1c...",
+  "claim": {
+    "goal_id": "Verisim.Entity.handle_call/3.post.2",
+    "qir": "sha256:9ab0...",
+    "layer": "A",
+    "module": "Verisim.Entity",
+    "function": "handle_call/3"
+  },
+  "status": "incomplete",
+  "trust_level": 4,
+  "route": [
+    {"prover": "why3", "version": "1.7.2", "result": "unsat", "time_ms": 412},
+    {"prover": "z3", "version": "4.13.0", "result": "unsat", "certificate": null},
+    {"prover": "dkcheck", "version": "2.7", "result": "QED", "artifact": "sha256:d00d..."}
+  ],
+  "assumptions": ["elaborator", "why3-dk"],
+  "artifacts": [
+    {"kind": "why", "path": "cache/why/Entity_post2.why", "sha256": "c0de..."},
+    {"kind": "dk",  "path": "cache/dk/Entity_post2.dk",  "sha256": "d00d..."}
+  ],
+  "origin": {"file": "lib/verisim/entity.ex", "line": 61, "column": 5},
+  "created_at": "2026-10-22T13:59:00Z",
+  "issuer": "quintessence",
+  "signature": "ed25519:..."
+}
+----
+
+`assumptions` is a list of TCB components that the proof depends on. It is not a
+free-form comment: each name is a key in the trust ledger, and the gate can
+reject a Warrant that assumes a component the policy forbids.
+
+`route` is ordered. A local kernel QED after an SMT oracle is stronger than the
+oracle alone, but it is still incomplete: the Dedukti translation is a TCB
+component, and the batch cross-check is missing.
+
+== Receipt schema
+
+[source,json]
+----
+{
+  "schema": "quintessence.receipt/v1",
+  "warrant": "sha256:6f1c...",
+  "claim": {"goal_id": "Verisim.Entity.handle_call/3.post.2", "qir": "sha256:9ab0..."},
+  "checks": [
+    {"kernel": "coq",  "version": "8.20.1", "proof_sha256": "a1...", "status": "QED"},
+    {"kernel": "lean4","version": "4.13.0", "proof_sha256": "b2...", "status": "QED"}
+  ],
+  "axioms": [],
+  "batch_mode": "reprove",
+  "coverage": {
+    "functional": ["why3-dk", "coq", "lean4"],
+    "metatheory": [],
+    "instance": ["coq", "lean4"]
+  },
+  "status": "complete",
+  "trust_level": 5,
+  "issuer": "echidna",
+  "issued_at": "2026-10-22T14:05:00Z",
+  "signature": "ed25519:..."
+}
+----
+
+`coverage` is the key to not overclaiming. For a Layer B receipt it might read:
+
+[source,json]
+----
+"coverage": {
+  "metatheory": ["agda:choreographic-types@<sha>"],
+  "instance": ["coq", "lean4"],
+  "bounded_model_check": ["apalache:12"]
+}
+----
+
+The gate checks the coverage table against the policy, not against a single
+`trust_level` number. A receipt can be `complete` for a Layer B instance while
+the metatheory is a pinned Agda library; that is visible in the JSON.
+
+=== Batch modes
+
+[cols="1,2,3",options="header"]
+|===
+| Mode | What the batch does | TCB / label
+
+| `reprove` (default)
+| Coq and Lean independently prove the same statement from the `.qir`.
+| No proof-translation TCB; the statement translation is shared and is part of
+  the elaborator TCB.
+
+| `transport` (Phase 5)
+| Translate the `.dk` witness to Coq and Lean; check the translated proofs.
+| `translation: assumed` until the translator is proved.
+
+| `kernel-direct` (Layer C, Lean)
+| Lean checks the `MaxPlus` arithmetic and the `tropical-types` instance; Coq
+  re-proves the arithmetic lemma.
+| Two kernels for the arithmetic; ZigProve's memory obligations remain
+  tool-level.
+|===
+
+== ECHIDNA integration
+
+ECHIDNA is the orchestrator, not a new prover. Quintessence uses its existing
+surface:
+
+[cols="2,3,3",options="header"]
+|===
+| ECHIDNA item | Use in quintessence | Notes
+
+| `TrustLevel` (`Level1`..`Level5`)
+| The `trust_level` field.
+| No parallel scale.
+
+| `TrustFactors` / `compute_trust_level`
+| Compute the level from the route, certificates, axioms, and portfolio.
+| Quintessence supplies the factors; ECHIDNA computes.
+
+| `ProofCertificate` / `CertificateFormat` / `CertificateVerifier`
+| Check Alethe, DRAT/LRAT, TSTP, Lean, Coq certificates.
+| A certificate is an artifact; the Receipt carries its hash.
+
+| `Proof` / `ProofVersion`
+| Stable `goal_hash`, `theorem_hash`, and version log.
+| The `goal_id` and `qir` hash are the join keys.
+
+| `MutationTester` / `MutationKind` / `MutationTestSummary`
+| The mutation/vacuity engine.
+| `target_score` defaults to 95.0; `meets_target` is the gate.
+
+| `axiom_tracker`
+| Forbidden axioms (`propext`, `classical_choice`, `believe_me`).
+| The receipt's `axioms` array must be empty for Level 5.
+|===
+
+The adapter is a Rust crate (`quintessence-echidna`) with two directions:
+
+* `Core.Term -> echidna::core::Term` for goals and mutations;
+* `echidna::verification::ProofResult -> Warrant` for evidence.
+
+The adapter MUST be total on the IR fragment. An unmappable term is
+`Q-501`, not a silent `Term::Const("unsupported")`.
+
+== The Why3/SMT/Dedukti route
+
+[source,text]
+----
+.qir goal
+  -> Why3 task
+  -> split VCs
+  -> SMT portfolio (z3, cvc5, alt-ergo)
+  -> unsat?
+       no  -> refuted / unknown
+       yes -> why3-dk reconstruction
+                -> .dk
+                -> dkcheck
+                     QED -> Warrant (incomplete, level 4)
+                     fail -> Q-502
+  -> batch Coq + Lean
+       both QED -> Receipt (complete, level 5)
+----
+
+The reconstruction fragment is quantifier-free linear arithmetic, equality,
+uninterpreted functions, algebraic data types, finite maps, and byte strings.
+Outside it, the status is `unchecked`; the SMT answer is a hint, not evidence.
+
+The `.dk` term is not a solver transcript. It is a proof term built from the
+goal's clausification and the fragment's rules. That makes it independent of the
+solver and makes the translator a TCB component. The translator is named
+`why3-dk` in every Warrant that uses it; the trust ledger records it.
+
+== Vacuity
+
+A proof of a vacuous specification is worse than no proof, because it looks like
+one. Four probes run before a Layer A or Layer B Receipt is issued, and a fifth
+extends the same idea to Layer C.
+
+=== V1: antecedent satisfiability
+
+For each function, the checker asks SMT for a model of the conjunction of
+preconditions. If the conjunction is unsatisfiable, the function is never
+callable under its contract and every postcondition is vacuous.
+
+[source,text]
+----
+pre = byte_size(payload) <= 1_048_576
+    and byte_size(payload) > 1_048_576
+------------------------------------------------ V1
+unsat -> Q-601 VACUOUS
+----
+
+The model is also used to generate a witness input for V3 and for the
+differential tests.
+
+=== V2: postcondition non-triviality
+
+Replace the function body with a fresh uninterpreted function of the same
+signature. If the postcondition still proves, it does not constrain the
+implementation; it is a tautology.
+
+[source,text]
+----
+body := fresh(payload)
+post  := result.digest != <<>>
+------------------------------------------------ V2
+proved for all fresh -> Q-602 TRIVIAL
+----
+
+The check is conservative: a postcondition that is *implied by the type* (for
+example, `is_binary(result)`) is flagged; the author must either strengthen it or
+mark it `type_only: true` with a reason.
+
+=== V3: mutation score
+
+ECHIDNA's `MutationTester` generates weakened specifications and re-runs the
+pipeline. A mutant is *caught* when the pipeline fails (refuted, unknown under a
+strict timeout, or a kernel reject). The score is:
+
+[source,text]
+----
+score = caught / (total - excluded)
+excluded = guard-only preconditions, type-only postconditions marked true
+threshold = 95.0 (default)
+----
+
+A score below the threshold is `Q-603 WEAK_SPEC`; the report names the surviving
+mutants and the obligations they weakened.
+
+The `excluded` set is the important refinement. A `@pre` that the proof never
+uses is a runtime guard; removing it cannot make the proof fail. Counting it as a
+survivor would punish a useful runtime check; counting it as caught would be a
+lie. The checker classifies it as `guard: true`, excludes it from the
+denominator, and requires a runtime test for it.
+
+=== V4: protocol reachability
+
+For Layer B, Apalache is asked for a state satisfying the protocol's knowledge
+goal. If the goal is unreachable, the protocol is vacuous (`Q-604
+VACUOUS_PROTOCOL`: it proves that something never happens because nothing
+happens).
+
+[source,text]
+----
+apalache-mc check --length=12 --cinit=ConstInit \
+  --inv=GoalReachable QuintessenceKCut.tla
+----
+
+A reachability witness is also a useful test case: it is replayed in the Elixir
+app and must produce the expected event.
+
+=== V5: NIF budget sanity
+
+For Layer C, a receipt is vacuous if `bound_us = 0`, `expr = bot`, or the
+schedule contradicts the bound (`normal` with `bound > threshold`). The checker
+also rejects a `MaxPlus` proof whose `expr` is a constant that does not mention
+the input size when the code loops over the input. These are Layer C codes
+(`Q-302` for an over-budget bound, `Q-305` for a schedule mismatch), not `Q-60x`:
+the vacuity probes V1-V4 belong to the sequential and protocol layers.
+
+== Mutation: the ECHIDNA engine and the quintessence plan
+
+ECHIDNA's `mutation.rs` provides:
+
+[source,rust]
+----
+pub enum MutationKind {
+    RemovePrecondition { index: usize },
+    WeakenPostcondition { original: String, weakened: String },
+    AddDisjunct { added: String },
+    RemoveHypothesis { index: usize },
+    ReplaceConstant { original: String, replacement: String },
+    NegateSubterm { position: usize },
+}
+
+pub struct MutationTester { pub target_score: f64 }
+impl MutationTester {
+    pub fn new() -> Self;
+    pub fn with_target(target_score: f64) -> Self;
+    pub fn generate_mutations(&self, term: &Term) -> Vec<(MutationKind, Term)>;
+    pub fn compute_summary(&self, results: Vec<MutationResult>) -> MutationTestSummary;
+}
+----
+
+`MutationTestSummary` has `total_mutations`, `mutations_caught`,
+`mutations_survived`, `mutation_score`, and `results`; `meets_target(95.0)` is
+the gate. The current generator is syntactic and conservative. Quintessence adds
+a layer-specific plan and sends each mutant as a separate goal:
+
+[cols="2,3,3",options="header"]
+|===
+| Layer | Mutant | Expected catcher
+
+| A
+| Drop a `@pre` conjunct.
+| V1 or a VC that uses the conjunct.
+
+| A
+| Weaken `digest = hash(payload)` to `digest != the empty binary`.
+| V2 or a solver counterexample.
+
+| A
+| Swap `:ok` and `:error` in a branch.
+| Postcondition on `result`.
+
+| A
+| Change `version + 1` to `version`.
+| Postcondition `new_state.version = old.version + 1`.
+
+| B
+| Replace `call` with `cast`.
+| K-CUT `Q-401`; the reply disappears.
+
+| B
+| Drop the reply message.
+| K-REPLY side condition.
+
+| B
+| Reorder independent messages.
+| K-CUT-LOSS equality or Apalache invariant.
+
+| B
+| Restart a process at a cut.
+| Epoch/`ProofTransport` obligation.
+
+| C
+| Widen `MaxPlus` bound.
+| Budget check `Q-302`.
+
+| C
+| Flip `dirty_cpu` to `normal`.
+| Schedule check `Q-305`.
+
+| C
+| Drop a receipt obligation.
+| Coverage check `Q-304`.
+|===
+
+A surviving mutant is not automatically a bug. It is a *question*: is the
+specification weak, or is the mutant semantically equivalent? The report includes
+the mutant, the goal, the solver result, and the counterexample (if any). The
+author must either strengthen the spec or record an equivalence argument. The
+gate fails on an unexplained survivor.
+
+=== Scoring without gaming
+
+The score is computed over *proof-relevant* obligations. A precondition that is
+never used in a proof is marked `guard: true` and excluded; it must be tested at
+runtime. A postcondition that is implied by the type is marked `type_only: true`
+and excluded; it must be justified. This prevents the two common games:
+
+* adding irrelevant preconditions to make removal mutants "caught" (they are
+  excluded, not caught);
+* adding tautological postconditions to make weakening mutants "caught" (they
+  are type-only, not proof-relevant).
+
+The report prints both the raw and the adjusted score. The gate uses the adjusted
+score and a minimum raw coverage (at least 10 proof-relevant mutants per module).
+
+== Caching, replay, and determinism
+
+Every artifact is content-addressed:
+
+[source,text]
+----
+cache_key = sha256(
+  qir_hash
+  + tool_pins (why3, z3, cvc5, alt-ergo, dkcheck, coq, lean, agda, idris2)
+  + config (timeouts, thresholds, mutation seed)
+  + obligation_id
+)
+----
+
+A cached Warrant is reused only if every input hash matches. `--replay` re-runs
+the kernel checks from the artifacts; it does not trust the cache. A tool pin
+change invalidates every artifact that used it; a solver timeout is cached as
+`unknown`, never as `proved`.
+
+Determinism requirements:
+
+* solver seeds fixed; `why3` session deterministic; no wall-clock in the proof
+  text;
+* MIRI/ASan runs are not part of the proof, only validation;
+* mutation order fixed by goal hash;
+* JSON canonicalized with JCS before hashing;
+* receipts carry the tool versions and the `.qir` hash.
+
+== CI policy
+
+[cols="1,3,3",options="header"]
+|===
+| Context | Command | Gate
+
+| Pull request (fast)
+| `mix verify --layer a --allow-oracle --format sarif`
+| Advisory; comments on the PR; blocks only `refuted`/`vacuous`.
+
+| Main branch
+| `mix verify --strict`
+| Every Layer A/C obligation at Level 4+; Layer B instance at Level 4 with
+  Apalache `BOUNDED`; no `assumed` in Layer A/C.
+
+| Release
+| `mix verify --strict --receipt`
+| Level 5 for Layer A/C; Layer B instance cross-checked in Coq and Lean, or a
+  signed exception; receipts committed; binary hash matches.
+
+| Nightly
+| `mix verify --all --mutation-full --apalache-length 20`
+| Full mutation, larger bounds, fuzzing; a failure opens an issue, does not
+  block a PR.
+|===
+
+The release gate is the only place a Receipt is required. A PR can be red on
+`unknown` without blocking, because a partial proof is useful feedback; it cannot
+be green on `refuted` or `vacuous`.
+
+== Security of evidence
+
+* Receipts are signed with Ed25519; the public key is pinned in the repo. An
+  unsigned receipt is not accepted in a release.
+* `quintessence.lock` pins tool versions and binary hashes; `mix
+  quintessence.doctor` verifies them.
+* The receipt contains no secrets, only hashes and provenance.
+* A revoked receipt is listed in `priv/receipts/revoked.json`; the loader checks
+  the revocation list before accepting a NIF.
+* A reproducible build is the defense against a substituted `.so`; the binary
+  hash plus the signature is the detection.
+
+The evidence system is not a blockchain and does not need one. It needs
+content-addressing, signatures, and a policy that says which checker is required
+for which claim.
+
+== Error codes
+
+The evidence ranges are fixed here; the other ranges belong to the documents
+that raise them (Layer A for `Q-1xx`/`Q-2xx`, Layer C for `Q-3xx`, Layer B for
+`Q-4xx`).
+
+[cols="1,2,3",options="header"]
+|===
+| Code | Name | Meaning
+
+| `Q-501` | `PROVER_FAILURE` | ECHIDNA could not run the prover, the transport
+  failed, or the tool returned no answer. Not a refutation.
+
+| `Q-502` | `AXIOM_REJECTED` | The certificate depends on a forbidden axiom
+  (`propext`, `classical_choice`, `believe_me`, or a policy addition), or the
+  axiom set in the artifact does not match the declared one.
+
+| `Q-503` | `KERNEL_MISMATCH` | A batch kernel checked a different theorem, or
+  two kernels disagree about the same obligation.
+
+| `Q-504` | `INCOMPLETE` | The gate requires `complete` and the receipt is
+  `incomplete`, `unknown`, `unchecked`, or `unsupported`.
+
+| `Q-601` | `VACUOUS` | V1: the conjunction of preconditions is unsatisfiable.
+
+| `Q-602` | `TRIVIAL` | V2: the postcondition holds for an uninterpreted body.
+
+| `Q-603` | `WEAK_SPEC` | V3: the mutation score is below the configured
+  threshold.
+
+| `Q-604` | `VACUOUS_PROTOCOL` | V4: no reachable state satisfies the protocol's
+  knowledge goal.
+
+| `Q-605` | `BOUNDED_COUNTEREXAMPLE` | Apalache found a violation within the
+  bound. The bound and the trace are recorded; the result is `refuted` for the
+  checked instance, not for all runs.
+|===
+
+`Q-605` is a refutation, not a timeout: the counterexample is a concrete
+execution, and it is replayed in the Elixir application before the report is
+written. A `BOUNDED` pass is not the dual of a `Q-605` failure; `BOUNDED PASS`
+means "no violation up to `k`".
+
+== Open issues
+
+* *Why3-dk proof.* The translator is a TCB component; Phase 5 proves it or keeps
+  `translation: assumed`.
+* *ECHIDNA mutation API.* The current `generate_mutations` is syntactic; the
+  layer-specific plan needs an extension point in ECHIDNA or a separate planner
+  that feeds `MutationKind` values.
+* *Agda trust level.* Agda is a small kernel, but ECHIDNA's Level 5 requires two
+  systems. The instance cross-check is the bridge; the metatheory remains
+  single-kernel.
+* *ZigProve proof terms.* The memory obligations are tool-level. If ZigProve emits
+  Coq/Lean proof terms, they can enter the batch; until then, they are Level 4.
+* *Solver certificates.* Not every SMT solver emits a checkable certificate for
+  every theory. The pipeline must fall back to `unchecked`, not to trust.
+* *Cost of the batch.* Coq and Lean re-proofs are expensive. The cache and the
+  `--layer` flag keep the inner loop fast; the release gate pays the cost.
+* *Receipt revocation.* A compromised tool version invalidates receipts; the
+  revocation list is a manual process in the MVP.

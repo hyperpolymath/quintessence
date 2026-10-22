@@ -17,6 +17,9 @@ Thumbs.db
 # Build
 target/
 _build/
+zig-out/
+**/zig-out/
+*.so
 /dist/
 /out/
 

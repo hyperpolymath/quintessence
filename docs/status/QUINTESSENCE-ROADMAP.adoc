@@ -1,0 +1,523 @@
+// SPDX-License-Identifier: CC-BY-SA-4.0
+// Copyright (c) 2026 Jonathan D.A. Jewell <j.d.a.jewell@open.ac.uk>
+= Quintessence Roadmap
+:toc:
+:toc-placement: preamble
+:toc-title: Contents
+:doctype: article
+:revdate: 2026-10-22
+:revnumber: 0.1.0-draft
+
+This is the delivery plan for the architecture in
+link:../architecture/QUINTESSENCE.adoc[the specification]. It is written as a
+sequence of phases with exit criteria, not a wish list. A phase is done when its
+exit criterion is met by a reproducible command, not when the code is merged.
+
+[IMPORTANT]
+====
+Reference plan. No phase is started in this checkout; there is no Elixir,
+Idris2, Zig, Agda, or Why3 toolchain present. The estimates are person-weeks for
+a small team and are deliberately conservative.
+====
+
+== Planning assumptions
+
+* Team: one Elixir/OTP engineer, one formal-methods engineer (Idris2/Agda/Why3),
+  one systems engineer (Zig/Rust/NIF), a shared CI/Docs engineer (0.5 FTE), and a
+  part-time reviewer for the trust ledger. About 3.5 FTE.
+* The estate libraries are available at pinned revisions; `MPR` and `ZigProve`
+  are available through their maintainers. If either is not, Phase 2 and the
+  `@cap` work carry an adapter risk (see link:../architecture/QUINTESSENCE.adoc#risks[risks]).
+* The MVP is one application, not a general Elixir verifier. It is chosen to
+  exercise all three layers with the smallest honest protocol.
+* No phase claims more than its evidence. A phase that cannot meet its exit
+  criterion is re-scoped, not declared done.
+
+== The MVP
+
+The MVP is a *vertical slice*:
+
+[source,text]
+----
+one pure module (Verisim.Spec)
++ one GenServer (Verisim.Entity)
++ one two-message request/reply protocol (client -> entity : commit .
+  entity -> client : committed)
++ one verified NIF (Verisim.Nif.hash/2 and drift/2)
++ one Level 5 Receipt for Layer A/C
++ one Level 4 Agda + Level 5 Coq/Lean instance check for Layer B
++ a mutation score >= 95%
++ a failing variant that proves the gate rejects a cast-based claim
+----
+
+It is not "all of Elixir". It is a credible end-to-end receipt for a small,
+real system, with every assumption visible.
+
+=== Six-week MVP slice
+
+[cols="1,3,3",options="header"]
+|===
+| Week | Work | Demo
+
+| 1
+| Repo initialisation (RSR mint), `mix.exs`, `quintessence.exs`, tool pins in
+  `mise.toml`, Core IR skeleton, receipt schemas, error codes, CI job that runs
+  `mix quintessence.doctor`.
+| `mix verify --help` and `mix quintessence.doctor` fail closed on a missing
+  tool; `.qir` round-trips.
+
+| 2
+| G0 tracer, macro allowlist, banned-call scan, sandbox expansion (bubblewrap),
+  bytecode import audit. Subset checker for literals, variables, `case`, maps,
+  lists, binaries, and one recursive function with a measure.
+| A deliberately malicious macro (`Code.eval_string`) is rejected with `Q-102`;
+  a non-deterministic macro is rejected with `Q-110`.
+
+| 3
+| Face attributes (`@cap`, `@pre`, `@post`, `@secret`, `@measure`), `spec/1`,
+  `@on_definition` attachment, `.qir` emission. Why3 projection for the pure
+  module.
+| `mix verify --layer a` prints VCs and hashes; `qir` is stable across runs.
+
+| 4
+| SMT dispatch (z3 + cvc5), Why3 proof session, mutation adapter for
+  `RemovePrecondition`/`WeakenPostcondition`, vacuity V1/V2. `mix verify` Layer A
+  gate.
+| One module proves 20+ VCs; a weakened postcondition is caught; a vacuous
+  precondition is rejected.
+
+| 5
+| Idris2 ABI for `hash`/`drift`, Zig core, Rustler wrapper, receipt schema,
+  load-time hash/obligation check, constant `MaxPlus` bound in Lean. `@nif` stub.
+| A stale receipt fails to load; a 1.4 ms fake bound forces `dirty_cpu`; a
+  normal NIF passes.
+
+| 6
+| Layer B static checker for the two-message protocol, `@choreography` parser,
+  K-CUT `Q-401` rejection, HWM bound for the mailbox, Apalache model for the
+  three-role protocol. Worked example end to end.
+| `mix verify --strict` passes on the example; flipping `call` to `cast` fails
+  with `Q-401` and the falsifier name.
+|===
+
+The six-week slice is a *demo*, not a release. It has no Coq/Lean batch, no
+general reply chain, and no composition theorem. It is enough to show that the
+architecture is real and to price the rest.
+
+== Phase 0: foundations (weeks 0-2)
+
+=== Deliverables
+
+* Repository initialised from the RSR template: `README.adoc` project name,
+  deed, `CITATION.cff`, licence, `mix.exs` with `elixir ~> 1.19`, `otp ~> 28`.
+* `quintessence.exs` schema and defaults; `quintessence.lock` with tool pins
+  (Elixir, OTP, Why3, z3, cvc5, alt-ergo, dkcheck, Coq, Lean, Agda, Idris2, Zig,
+  Rustler).
+* `Quintessence.Core` Idris2 package (`core.ipkg`), total, no `believe_me`.
+* Warrant/Receipt JSON schemas (`priv/schemas/warrant.schema.json`,
+  `receipt.schema.json`) in I-JSON/JCS form.
+* Error code registry (`docs/architecture/QUINTESSENCE-ERRORS.adoc` or the
+  appendix in the main spec) with stable codes.
+* `mix quintessence.doctor` skeleton: checks each tool's presence and version,
+  fails closed.
+* CI: `lint`, `test`, `doctor`, `spec-render` (AsciiDoc, repo map).
+* Golden corpus skeleton: 10 small modules with hand-written `.qir` and expected
+  VCs.
+
+=== Exit criteria
+
+* `mix quintessence.doctor` exits 3 on a missing tool and 0 on a complete
+  toolchain.
+* `.qir` round-trips through canonical JSON and CBOR; the hash is stable across
+  runs and locales.
+* The schemas validate the example Warrant and Receipt; a missing field fails.
+* CI is green on the empty corpus.
+
+=== Risks
+
+* RSR mint and toolchain install may take longer than two weeks; the IR and
+  schemas do not depend on them.
+* Tool version drift; pin early, pin hard.
+
+== Phase 1: Layer A (weeks 2-8)
+
+=== Deliverables
+
+* G0 firewall: tracer, allowlist, banned-call scan, `bubblewrap`/`nsjail`
+  sandbox, double expansion, bytecode import audit.
+* G1 subset checker: grammar, types, refinements, exhaustiveness, measures.
+* Face: `spec/1`, `@cap`, `@pre`, `@post`, `@invariant`, `@secret`,
+  `@declassify`, `@measure`; `@on_definition` attachment; `.qir` emission.
+* Why3 projection for the pure fragment; VC splitting; SMT dispatch; `why3
+  replay`.
+* `why3-dk` reconstruction for QF-LIA + UF + ADT + arrays + bytes; `dkcheck`
+  integration; `UNCHECKED` status for the rest.
+* TINI MVP: two-point lattice, implicit flows, `@declassify`, MPR R5 adapter.
+* ECHIDNA adapter: `Core.Term` to `echidna::core::Term`; Warrant assembly;
+  `MutationTester` integration; V1/V2.
+* `mix verify` Layer A command, JSON/SARIF output, exit codes.
+
+=== Exit criteria
+
+* The golden corpus (10 modules, 100+ VCs) is proved with no `unknown` in the
+  release path; the SMT oracle is allowed only in `--allow-oracle`.
+* A mutation score of at least 95% on proof-relevant obligations.
+* A vacuous precondition is rejected (`Q-601`); a trivial postcondition is
+  rejected (`Q-602`).
+* A secret-to-public flow without `@declassify` is rejected (`Q-204`); a
+  `File`/`net` corridor is rejected by R5.
+* The `.qir` hash and the Warrant are reproducible from a clean checkout.
+
+=== Risks
+
+* The Why3-to-Dedukti reconstruction is the critical path. If the fragment is
+  too small, the release gate has too many `UNCHECKED` goals.
+* Elixir AST drift across 1.19/1.20; pin and test.
+* The macro sandbox may break legitimate macros; the allowlist must be reviewed
+  with the application team.
+* TINI for Elixir is not the same as TINI for a `while` language; the adapter
+  must model Elixir's evaluation order and implicit flows carefully.
+
+== Phase 2: Layer C (weeks 8-14)
+
+=== Deliverables
+
+* Idris2 ABI module for one NIF (`Verisim.Abi`): state-indexed handle, linear
+  resource, `Buffer`, `Digest`, `Drift`, `%foreign` signatures.
+* Zig core (`verisim_hash`, `verisim_drift`), allocation-free, no globals, no
+  `@cImport`.
+* Rustler wrapper: `ResourceArc<Core>`, term decoding, error mapping, schedule
+  annotation.
+* ZigProve adapter: receipt schema, obligation mapping, binary hash, target,
+  `optimize` flag.
+* `MaxPlus` binder: cost AST, straight-line and bounded-loop rules, Lean checker
+  importing `tropical-types`, threshold/margin decision.
+* `@nif` stub and `@on_load` receipt checks; `dirty_cpu` enforcement.
+* Integration tests: happy path, stale receipt, tampered binary, wrong schedule,
+  1 MiB + 1 payload.
+
+=== Exit criteria
+
+* A NIF ships with a complete receipt: 12/12 obligations `proved`, binary hash
+  matches, schedule matches the Rustler annotation.
+* A 1.4 ms NIF is either forced `dirty_cpu` or rejected; a `normal` annotation
+  with a `dirty_cpu` receipt fails `Q-305`.
+* A receipt with one `assumed` obligation fails to load.
+* A tampered `.so` fails the hash check.
+* The `MaxPlus` bound is reproduced by Lean from the receipt's `expr`.
+
+=== Risks
+
+* ZigProve's obligation names/coverage may differ; adapter and coverage check
+  mitigate.
+* Rustler version drift; pin and test term encoding.
+* `ReleaseFast` disables bounds checks; the receipt must record `optimize` and
+  reject a `ReleaseFast` build for a `ReleaseSafe` proof.
+* Dirty-pool saturation is not covered by a single-NIF bound; a pool/semaphore is
+  Phase 4.
+
+== Phase 3: Layer B0 (weeks 14-20)
+
+=== Deliverables
+
+* `@choreography` parser and well-formedness checks.
+* GenServer mapping: `handle_call`, `handle_cast`, `handle_info`, `init`,
+  `terminate`; callback coverage; bytecode call audit (`GenServer.call` vs
+  `cast`).
+* K-CUT static checker: K-SEND, K-CAST, K-RECV, K-CALL, K-REPLY, K-MON,
+  K-RESTART; `Q-401` for unwarranted claims; `Q-402` outside the fragment.
+* Agda instance emission for the two-message protocol; import
+  `choreographic-types` at the pinned SHA; check with `--safe --without-K`.
+* Occupancy: HWM grade from the protocol; arrival/service bound; selective
+  receive check; backpressure obligation.
+* Apalache: TLA+ model, `NoUnwarrantedRemoteClaim`, `MailboxBound`,
+  `EpochConsistent`; bounded run in CI.
+* Runtime conformance monitor for tests; trace replay.
+* Worked example end to end.
+
+=== Exit criteria
+
+* The worked example passes with a Level 4 Agda instance and a `BOUNDED`
+  Apalache run.
+* A cast-based remote claim is rejected with `Q-401` and the falsifier name.
+* A mailbox that exceeds its HWM in the model produces a counterexample; the
+  Elixir replay reproduces it.
+* A protocol outside the fragment (recursion, full merge) is rejected with
+  `Q-402`, not approximated.
+* The K-CUT instance is checked by Agda at the pinned library revision.
+
+=== Risks
+
+* The two-message fragment may be too narrow for the first real protocol; the
+  fallback is to add a direct reply, not to widen the claim.
+* Apalache state explosion; bound the model and label it `BOUNDED`.
+* The runtime monitor may be expensive; sample or test-only.
+* The Face can lie about callbacks; the bytecode audit and monitor are the
+  independent checks.
+
+== Phase 4: Layer B1 and distribution (weeks 20-28)
+
+=== Deliverables
+
+* Co-develop the general reply-chain theorem with `choreographic-types`
+  (position-indexed Y-5/Y-6, general Y-8).
+* Binary choice in the Face (`choices:`) if the library fragment supports it.
+* Restart epochs and `ProofTransport` certificates; durable state receipts.
+* Distributed loss: node partitions, `noconnection`, timeouts; async cut model.
+* Occupancy-types integration: Session IR checker for the mailbox discipline;
+  HWM algebra alignment with `choreographic-types`.
+* Dirty-pool concurrency bound; `MaxPlus` for allocating cores (Phase 2
+  extension).
+
+=== Exit criteria
+
+* A three-message protocol is either proved by the extended library or
+  explicitly `assumed`; no claim exceeds the library.
+* A restart during an in-flight reply invalidates the knowledge claim unless a
+  durable receipt matches the epoch.
+* A partition is modeled as loss; the sender's ignorance is `Q-401`.
+* A concurrent NIF pool has a proved concurrency bound.
+
+=== Risks
+
+* The library extension may not land; the MVP stays at two messages.
+* Distributed testing is expensive; use a deterministic simulator first.
+* `occupancy-types` is early-stage; the integration may require co-development.
+
+== Phase 5: evidence hardening (weeks 28-36)
+
+=== Deliverables
+
+* Prove the `why3-dk` translation for the decidable fragment, or keep
+  `translation: assumed` and restrict the release gate.
+* `transport` batch mode: `.dk` to Coq/Lean, checked.
+* Composition theorem in Agda: Layer A/B/C interfaces, induction over cuts.
+* Coq/Lean instance cross-check for Layer B (finite protocol), Level 5.
+* Full mutation plan (Layer A/B/C), V3/V4, guard/type-only classification.
+* Signed receipts, revocation list, reproducible build manifest.
+* `mix verify --strict --receipt` release gate; independent audit.
+
+=== Exit criteria
+
+* A Receipt is reproducible from the `.qir` and the tool pins alone.
+* The composition theorem is machine-checked, or the receipt says
+  `composition: assumed` and the release gate refuses the claim.
+* The independent audit reproduces the example receipt and finds no overclaim.
+* No `UNCHECKED` obligation in the release path; `--allow-oracle` cannot produce
+  a Receipt.
+
+=== Risks
+
+* Proving the translation is a research project; if it slips, keep the TCB
+  label and narrow the release claim.
+* Coq/Lean batch cost; cache and incremental checking.
+* Audit capacity; budget for an external reviewer.
+
+== Phase 6: scale (weeks 36+)
+
+=== Deliverables
+
+* More primitives: bitstrings, floats (with a model), `Enum`/`Map` coverage,
+  structs with refined fields.
+* Editor integration (LSP diagnostics for `Q-*`), `mix quintessence.explain`.
+* Public alpha: docs, examples, a migration guide, a support policy.
+* Upstream contributions: `choreographic-types` reply chain,
+  `occupancy-types` HWM algebra, ECHIDNA mutation planner, tropical-types
+  Lean↔Agda bridge.
+* Performance: verification time p95, cache hit rate, parallel layer dispatch.
+
+=== Exit criteria
+
+* An external team verifies a nontrivial app without bespoke patches.
+* The false-positive rate on the corpus is below 10%.
+* Verification time for a 50-module app is under 30 minutes on CI.
+
+== Work breakdown
+
+[cols="1,3,2,1",options="header"]
+|===
+| WP | Deliverable | Depends on | Estimate (pw)
+
+| WP-01 | Repo init, tool pins, CI | none | 2
+| WP-02 | Core IR (Idris2) | WP-01 | 4
+| WP-03 | Warrant/Receipt schemas, error codes | WP-01 | 2
+| WP-04 | G0 firewall (tracer, sandbox, audit) | WP-01 | 6
+| WP-05 | G1 subset checker | WP-02, WP-04 | 8
+| WP-06 | Face elaborator (`@cap`, `@pre`, `@post`, ...) | WP-02 | 6
+| WP-07 | Why3 projection + VC splitting | WP-05, WP-06 | 6
+| WP-08 | SMT dispatch + Why3 replay | WP-07 | 4
+| WP-09 | `why3-dk` reconstruction + `dkcheck` | WP-07 | 8
+| WP-10 | TINI + MPR R5 adapter | WP-05 | 6
+| WP-11 | ECHIDNA adapter + Warrant assembly | WP-03 | 5
+| WP-12 | Mutation/vacuity (V1-V4) | WP-11 | 5
+| WP-13 | `mix verify` Layer A | WP-05..WP-12 | 4
+| WP-14 | Idris2 ABI + Zig core + Rustler | WP-02 | 8
+| WP-15 | ZigProve receipt adapter | WP-14 | 5
+| WP-16 | `MaxPlus` binder + Lean checker | WP-08 | 5
+| WP-17 | NIF stub + load-time checks | WP-14, WP-15 | 3
+| WP-18 | `@choreography` parser + GenServer mapping | WP-06 | 6
+| WP-19 | K-CUT static checker + Agda instance | WP-18 | 8
+| WP-20 | Occupancy/HWM + selective receive | WP-19 | 5
+| WP-21 | Apalache model + CI | WP-19 | 6
+| WP-22 | Runtime monitor + trace replay | WP-18 | 4
+| WP-23 | Worked example + docs | WP-13, WP-17, WP-21 | 4
+| WP-24 | Reply-chain co-development | WP-19 | 12
+| WP-25 | Composition theorem (Agda) | WP-19, WP-24 | 10
+| WP-26 | `why3-dk` proof | WP-09 | 12
+| WP-27 | Batch Coq/Lean + signed receipts | WP-11 | 6
+|===
+
+The estimates sum to about 160 person-weeks. At 3.5 FTE that is roughly 46
+working weeks before integration and review overhead, so the phase dates above
+are _indicative and effort-led_: with fewer people the later phases move out in
+proportion, and no phase is declared done early. The six-week MVP slice covers
+WP-01 to WP-06, WP-13, WP-14, WP-15, WP-17, WP-18, and a subset of
+WP-19/WP-21.
+
+== Staffing and skills
+
+[cols="1,3,2",options="header"]
+|===
+| Role | Skills | FTE
+
+| Elixir/OTP engineer
+| GenServer, supervision, `:beam_lib`, compiler tracers, Rustler, Mix tasks
+| 1.0
+
+| Formal methods engineer
+| Idris2 QTT, Agda `--safe --without-K`, Why3/WhyML, SMT, Dedukti
+| 1.0
+
+| Systems engineer
+| Zig, Rust, C ABI, NIF, `ResourceArc`, allocators, sanitizers
+| 1.0
+
+| CI/docs
+| GitHub Actions, reproducible builds, AsciiDoc, schema validation
+| 0.5
+
+| Review/trust
+| Independent proof review, security review, release audit
+| 0.25
+|===
+
+The formal methods engineer is the critical path. If only one specialist is
+available, Phase 1 (Layer A) and Phase 2 (Layer C) can run in parallel with the
+Elixir and systems engineers, but the K-CUT work (Phase 3/4) will wait.
+
+== Metrics and gates
+
+[cols="2,3,2",options="header"]
+|===
+| Metric | Definition | Target
+
+| Obligation coverage
+| Goals with a Receipt / goals generated
+| 100% for release paths; 0 `UNCHECKED`
+
+| Kernel coverage
+| Goals checked by at least one kernel / goals
+| 100% for Level 4; 100% cross-checked for Level 5
+
+| Mutation score
+| Caught / (total - excluded)
+| >= 95%, at least 10 proof-relevant mutants per module
+
+| Vacuity
+| V1-V4 findings
+| 0 in release paths
+
+| K-CUT coverage
+| Knowledge claims inside the proved fragment / all claims
+| 100%; any outside is `assumed` and visible
+
+| NIF receipt coverage
+| NIFs with a complete receipt / NIFs
+| 100%
+
+| `MaxPlus` coverage
+| NIFs with a bound <= threshold or `dirty_cpu` / NIFs
+| 100%
+
+| False-positive rate
+| Rejected valid programs / all verified programs
+| < 10% on the corpus
+
+| Verification time
+| `mix verify --strict` p95 for 50 modules
+| < 30 minutes
+|===
+
+A release is blocked by any `refuted`, `vacuous`, `UNCHECKED` in a release path,
+a missing NIF receipt, a K-CUT claim outside the fragment, or a mutation score
+below 95%. A PR is blocked only by `refuted`/`vacuous`; `unknown` is feedback.
+
+== Decision log and open questions
+
+[cols="1,3,3",options="header"]
+|===
+| ID | Decision | Recommendation
+
+| D1
+| Native shape: Rustler + Zig static library, or pure Zig NIF.
+| Rustler + Zig for the MVP; pure Zig only for a measured zero-copy need.
+
+| D2
+| K-CUT scope: two-message reply only, or co-develop the general reply chain
+  now.
+| Two-message for the MVP; co-develop the chain in Phase 4. Do not claim the
+  chain before it is proved.
+
+| D3
+| K-CUT evidence: Agda-only instance, or Coq/Lean instance cross-check.
+| Agda instance + Coq/Lean finite-instance cross-check for Level 5; label the
+  metatheory as Agda.
+
+| D4
+| Why3-to-Dedukti: prove the translation, or keep it as a TCB.
+| Keep it as a named TCB for Phase 1; prove it in Phase 5. If it slips, restrict
+  the release claim, do not hide the assumption.
+
+| D5
+| Tool pinning for MPR and ZigProve.
+| Pin a revision before Phase 2; if unavailable, build the adapter and mark
+  `assumed`.
+
+| D6
+| `@trusted` policy.
+| Forbidden in `--strict`; allowed in development with a signed receipt and a
+  visible `assumed` in the report.
+
+| D7
+| Batch mode.
+| `reprove` by default; `transport` only after the translator is proved.
+|===
+
+== Kill criteria
+
+A phase stops and re-scopes if any of these holds:
+
+* The Why3-to-Dedukti fragment covers less than 60% of the corpus's VCs after
+  two weeks of work; the release gate cannot be met, so the architecture needs a
+  different kernel route (Coq/Lean direct).
+* The K-CUT instance cannot be expressed in the proved fragment for the first
+  real protocol; the MVP protocol is too ambitious, so narrow it.
+* ZigProve cannot produce a complete receipt for a non-trivial NIF; the NIF
+  boundary is not ready, so keep the pure subset and defer the NIF.
+* The macro firewall rejects more than 20% of the application's legitimate
+  macros; the allowlist process is too strict, so add reviewed receipts, not
+  blanket exceptions.
+* The composition theorem cannot be stated over the layer interfaces; the
+  layers' claims are not composable, so the release claim must be per-layer.
+
+Stopping is a result. Shipping a green gate with an overclaim is not.
+
+== What not to build
+
+* A general Elixir parser. Use the compiler's AST and pin the version.
+* A new SMT solver. Use z3/cvc5/alt-ergo and ECHIDNA's portfolio.
+* A new proof assistant. Use Idris2, Agda, Coq, Lean.
+* A runtime verification engine. Use the static pipeline; the runtime monitor is
+  a test oracle.
+* A package manager or a build system. Use Mix and the existing Rust/Zig builds.
+* A dashboard before the receipts. The JSON is the product.

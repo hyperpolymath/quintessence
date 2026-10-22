@@ -1,0 +1,238 @@
+// SPDX-License-Identifier: CC-BY-SA-4.0
+// Copyright (c) 2026 Jonathan D.A. Jewell <j.d.a.jewell@open.ac.uk>
+= Quintessence worked example: VeriSimDB entity
+:toc:
+:toc-placement: preamble
+:toc-title: Contents
+:doctype: article
+
+[IMPORTANT]
+====
+This is a *reference tree*, not a buildable application. No Elixir, Zig,
+Idris2, Agda, or Why3 toolchain is invoked by the repository that contains it.
+The code fixes interfaces and proof obligations; the JSON hashes are
+illustrative. The specification it illustrates is
+link:../../docs/architecture/QUINTESSENCE.adoc[the architecture document].
+====
+
+== What this example is for
+
+One entity state `GenServer`, one verified NIF, one three-role protocol. It is
+small enough to read and large enough to exercise all three layers:
+
+* Layer A: the pure model (`Verisim.Spec`) and the handler contracts.
+* Layer B: the two-message `call`/reply that gives the client knowledge, and the
+  one-way `cast` that gives the auditor knowledge but gives the entity none.
+* Layer C: the `Verisim.Nif` stub, the `Verisim.Abi` Idris2 spec, the Zig core,
+  and the receipt that decides `normal` versus `dirty_cpu`.
+
+== Tree
+
+[cols="1,3",options="header"]
+|===
+| File | What it shows
+
+| `lib/verisim/spec.ex`
+| The pure logical model: `digest_of/1`, `drift_of/2`, a total recursive
+  `depth/1` with `@measure`, and `@pre`/`@post` attributes.
+
+| `lib/verisim/entity.ex`
+| The `GenServer` with `@cap`, `@secret`, `@declassify`, `@invariant`,
+  `@choreography`, and per-handler contracts. The `handle_cast` deliberately
+  makes no claim about the auditor.
+
+| `lib/verisim/nif.ex`
+| The NIF stub: `use Quintessence.Nif`, `@nif` with `schedule: :auto`, and no
+  business logic.
+
+| `priv/native/verisim_nif.zig`
+| The Zig core: allocation-free, global-free, no `@cImport`, SHA-256 and
+  basis-point drift.
+
+| `priv/receipts/verisim_nif.receipt.json`
+| The ZigProve receipt: twelve obligations, binary hash, target, and the
+  `MaxPlus` budget.
+
+| `spec/VerisimEntity.idr`
+| The Idris2 state and contract shapes; the protocol is a list of typed
+  messages.
+
+| `spec/verisim_entity.tla`
+| The Apalache *instance*: mailbox, in-flight messages, epochs, warranted
+  knowledge, and the `NoUnwarrantedRemoteClaim` invariant. The reusable pattern
+  module is `QuintessenceKCut` in
+  link:../../docs/architecture/QUINTESSENCE-LAYER-B.adoc[Layer B]; this file fixes
+  `Roles = {c, e, a}` and a small `MaxMailbox` for a finite check.
+
+| `quintessence.exs`
+| The verification configuration: layers, receipt policy, thresholds, batch
+  mode.
+
+| `mix/tasks/verify.ex`
+| The `mix verify` orchestrator sketch.
+|===
+
+== The protocol, and the boundary it respects
+
+[source,text]
+----
+client -> entity : commit(payload)          (GenServer.call)
+entity -> client : committed(version, d)    (reply; the warrant)
+entity -> auditor: attest(version, d)       (GenServer.cast; no reply)
+----
+
+`choreographic-types` proves, for the two-message reply protocol
+`0 -> 1 : a . 1 -> 0 : b`:
+
+* the receiver of the first message knows it was sent (`Y-5`);
+* the sender does **not** know the receiver received it (`Y-6`, the confirmed
+  pre-registered falsifier);
+* a reply restores the sender's knowledge (`Y-8`).
+
+The client's claim is exactly the two-message case, so it is inside the proved
+fragment. The auditor's claim is the receiver-side half of the third message; it
+is allowed because the auditor is the receiver. The entity's claim about the
+auditor is *not* allowed: there is no reply. The `forbid` entry in
+`lib/verisim/entity.ex` makes that explicit, and the checker rejects the module
+if a future edit adds the claim.
+
+This is the difference between "the message was sent" and "the message was
+received". A `cast` is not a commit. A `call` reply is a warrant only when the
+reply is causally after the commit and carries the version/epoch.
+
+=== Why the TLA+ module has a different name
+
+`QuintessenceKCut` is the *pattern*: cuts, views, warrants, and the two
+invariants, parametric in `Roles`, `Values`, `MaxMailbox`, and `MaxEpochs`.
+`VerisimEntity` is one *instance* of that pattern for the three-role protocol in
+this example. Apalache checks the instance, because a finite model is what a
+model checker can check; the pattern document (`QUINTESSENCE-LAYER-B.adoc`) states
+which parts of the pattern are proved in Agda and which are assumptions.
+
+== The NIF, and the scheduler decision
+
+The stub declares `schedule: :auto`; the receipt says `normal` with a bound of
+240 us. `use Quintessence.Nif` checks, at load time:
+
+. The receipt schema and target.
+. The `.so` SHA-256 against `binary_sha256`.
+. Every obligation is `proved` (12/12).
+. The `MaxPlus` bound is within the budget and threshold.
+. The schedule matches the Rustler annotation.
+
+A 1.4 ms NIF would produce `bound_us: 1400` and `schedule: dirty_cpu`; the stub
+would load it only if the Rustler annotation was `DirtyCpu`. A 1.4 ms NIF with a
+`normal` annotation is `Q-305`. A 1.4 ms NIF with a 1 ms budget is `Q-302`.
+
+The `MaxPlus` expression is `max(180, 240) = 240`: choice is `max`, sequence is
+`+`. The Lean checker imports `tropical-types` and checks the arithmetic; the
+receipt carries the proof hash.
+
+== A passing run
+
+[source,text]
+----
+$ mix verify --module Verisim.Entity --receipt
+==> quintessence 0.1.0 (qir/v1, elixir 1.19.0, OTP 28)
+[g0] firewall: 2 modules, 11 macro calls, allowlist ok, expansion hash 7c3a...
+[g1] subset: 9 functions, 2 handlers, 1 protocol, 0 rejected
+[qir] sha256:9ab0...
+[layer a] Verisim.Entity.handle_call/3: 9 VCs -> 9 proved (why3 1.7.2)
+          Verisim.Spec.drift_of/2: 4 VCs -> 4 proved
+          Verisim.Spec.depth/1: 2 VCs -> 2 proved (measure: length(history))
+          Verisim.Spec.digest_of/1: 1 VC -> 1 proved
+[layer b] protocol Verisim.Entity: 3 roles, 3 messages, 2 knowledge claims
+          B1 client<-entity: call/commit + reply/committed -> K-CUT-WARRANT OK
+          B2 auditor<-entity: cast/attest -> receiver-knows-sent OK
+          B3 entity->auditor: no claim; forbid check OK
+          B4 mailbox HWM: 64 <= 128 (bound 128)
+[layer c] Verisim.Nif.hash/2: receipt sha256:dad8..., MaxPlus 180us -> normal
+          Verisim.Nif.drift/2: receipt sha256:dad8..., MaxPlus 240us -> normal
+[echidna] 23 goals -> 23 warrants; 23 dk checked; batch: 23 Coq QED, 23 Lean QED
+[receipt] sha256:5e11... trust_level 5, status complete
+[mutate] 18 mutants, 18 caught, 0 survived (100%), vacuity V1-V4 clean
+[gate] PASS
+----
+
+The output is illustrative, but every line corresponds to an obligation in the
+specification. The `[layer b]` lines are the ones that no existing BEAM tool
+would print.
+
+== The failing variant that matters
+
+Change the client to `GenServer.cast(Verisim.Entity, {:commit, payload})` and
+keep the `knowledge` claim:
+
+[source,text]
+----
+$ mix verify --strict
+[layer b] B1 client->entity: cast/commit has no causal reply
+          Q-401 UNWARRANTED_REMOTE_CLAIM
+          falsifier: AsyncKnowledge.sender-cannot-know-receipt
+          remedy: use GenServer.call/3 and claim after the reply, or
+                  drop the knowledge claim and keep only the send fact
+[gate] FAIL
+----
+
+There is no `--allow-unwarranted` flag. The two legal repairs are:
+
+. Change the protocol to `call` and claim after the reply. The claim is then the
+   `Y-8` two-message case.
+. Drop the claim and keep `K_client(sent(commit))`. The client still knows it
+   sent the message; it does not know the entity received it.
+
+A third option, marking the claim `assumed` with a receipt, is visibly not a
+K-CUT proof and is not accepted by `--strict`.
+
+== A vacuity report
+
+Suppose the postcondition were weakened to `result.digest != the empty binary`. The mutation
+engine replaces the equality with the weak predicate; every non-empty digest
+satisfies it, so the mutant survives:
+
+[source,text]
+----
+[mutate] 18 mutants, 17 caught, 1 survived (94.4%) < 95.0%
+         survivor: WeakenPostcondition
+           original: new_state.digest == Verisim.Spec.digest_of(payload)
+           weakened: new_state.digest != <<>>
+           goal: Verisim.Entity.handle_call/3.post.2
+         remedy: restore the equality; the weak predicate is type-only
+[gate] FAIL
+----
+
+If the precondition were `byte_size(payload) <= 1_048_576 and
+byte_size(payload) > 1_048_576`, V1 would find no model and report `Q-601
+VACUOUS` before any proof was attempted. A proof of a vacuous spec is not a
+proof.
+
+== What is assumed here
+
+* `Verisim.Spec.digest_of/1` is the logical model; the NIF receipt proves the
+  implementation refines it. The model uses `:crypto.hash/2` for executability;
+  a production build swaps in BLAKE3 and a corresponding receipt.
+* The NIF receipt is valid for the built `.so`; the hashes in this tree are
+  illustrative.
+* The client and entity are authenticated; the network is not Byzantine.
+* The `commit`/`committed` exchange is exactly the two-message protocol in the
+  `choreographic-types` fragment. The `attest` edge is a one-way message; the
+  auditor is its receiver, and the entity has no reply.
+* The mailbox bound uses the configured arrival curve and the service bound; it
+  is an operational model, not a theorem about the BEAM scheduler.
+* The composition theorem is a paper argument in this example; Phase 5 closes it
+  in Agda.
+
+== Reading order
+
+. link:../../docs/architecture/QUINTESSENCE.adoc[Architecture] — the whole
+   pipeline and the trust ledger.
+. link:../../docs/architecture/QUINTESSENCE-LAYER-A.adoc[Layer A] — the subset,
+   the typing rules, the firewall.
+. link:../../docs/architecture/QUINTESSENCE-LAYER-B.adoc[Layer B] — K-CUT, the
+   falsifier, occupancy, Apalache.
+. link:../../docs/architecture/QUINTESSENCE-LAYER-C.adoc[Layer C] — QTT, the
+   receipt, `MaxPlus`.
+. link:../../docs/architecture/QUINTESSENCE-EVIDENCE.adoc[Evidence] — Warrants,
+   Receipts, mutation, vacuity.
+. link:../../docs/status/QUINTESSENCE-ROADMAP.adoc[Roadmap] — phases and exit
+   criteria.

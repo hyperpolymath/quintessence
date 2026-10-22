@@ -14,6 +14,22 @@ and CI fails if it goes stale, so prefer it over any hand-written listing.
 * link:AI_INSTALLATION_GUIDE.adoc[AI_INSTALLATION_GUIDE] — for an AI agent instantiating the template.
 * link:EXPLAINME.adoc[EXPLAINME] — how the pieces actually work.
 
+== Quintessence specification
+
+The architecture for this repository's project:
+
+* link:architecture/QUINTESSENCE-IMPLEMENTATION-PLAN.adoc[Implementation Plan] — engineering blueprint, `v0.1.0-alpha` working implementation, solver/ELF findings, and Milestones M1--M5.
+* link:architecture/QUINTESSENCE.adoc[QUINTESSENCE] — the whole pipeline and the
+  trust ledger.
+* link:architecture/QUINTESSENCE-LAYER-A.adoc[Layer A] — the sequential subset.
+* link:architecture/QUINTESSENCE-LAYER-B.adoc[Layer B] — OTP, cuts, K-CUT.
+* link:architecture/QUINTESSENCE-LAYER-C.adoc[Layer C] — Idris2/Zig NIF boundary.
+* link:architecture/QUINTESSENCE-EVIDENCE.adoc[Evidence] — Warrants, Receipts,
+  vacuity and mutation.
+* link:status/QUINTESSENCE-ROADMAP.adoc[Roadmap] — phases, exit criteria, work
+  breakdown.
+* link:decisions/0004-three-layer-architecture.adoc[ADR-0004] — why three layers.
+
 == The tracks
 
 [cols="1,3",options="header"]
