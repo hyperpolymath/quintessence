@@ -43,15 +43,35 @@ three properties the standard BEAM toolchain does not:
 
 [IMPORTANT]
 ====
-*Current implementation state (`v0.1.0-alpha` vertical slice):* The native Zig
-compiler/verifier (`src/core/` + `src/interface/ffi/`), dual Z3 5.3.1 + CVC5
-1.4.2 SMT & Alethe proof-DAG kernel checker, `k = 12` symbolic BMC engine,
-Layer C `MaxPlus` / `dlopen` / SHA-256 receipt verifier, 6-kind ECHIDNA mutation
-engine, Elixir Mix frontend (`mix.exs`, `lib/`), and 15-case live regression
-suite (`tests/quintessence/run_suite.sh`) *compile and execute today*, producing
-honest `TrustLevel 4` local certificates. Batch `coqc` + `lean` `TrustLevel 5`
-promotion and `beam_lib` bytecode tracing are scheduled in Milestones M1--M5 of
-link:docs/architecture/QUINTESSENCE-IMPLEMENTATION-PLAN.adoc[the Implementation Plan].
+*Status: alpha prototype (`0.1.0`). Its output is not a proof certificate.*
+
+What runs today, checked on 2026-11-15 with Zig 0.17.1, Z3 4.8.12 and cvc5 1.1.2:
+
+* The Zig engine and the CLI build. The 10 Zig unit tests pass.
+* The end-to-end suite (`tests/quintessence/run_suite.sh`, 16 cases) gives 14
+  passed and 2 failed with those solver versions. Cases 2 and 15 fail. Two cvc5
+  certificates come back empty, and the committed NIF receipt hash does not match
+  a fresh build. The suite was written for Z3 5.3.1 and cvc5 1.4.2. `mise.toml`
+  does not pin them, and no CI workflow runs the suite yet.
+
+Limits of the evidence. Read them before you rely on a result:
+
+* The Alethe check is structural (`src/core/smt_alethe.zig`). It checks proof
+  shape, premise order and the final empty clause, and it counts rule names. It
+  does not validate each rule application.
+* The `k = 12` bounded model check unrolls one generic protocol model
+  (`src/core/layer_b.zig`). It does not model the GenServer code under test.
+* Layer C checks one nullable-pointer rule and a list of banned patterns. The
+  `MaxPlus` bound is a pattern heuristic and not a worst-case execution time.
+  The NIF receipt records all of C1 to C12 as `proved`. Treat those entries as
+  not checked.
+* The mutation engine is local code that uses Z3 only. It does not call ECHIDNA.
+* The maximum trust level is 4. Level 5 needs Coq and Lean 4 kernel checks of the
+  emitted obligations, and this version does not run them.
+* No Agda, Rocq or Lean proof of the design exists in this repository.
+  link:docs/status/PROOF-STATUS.adoc[The proof ledger] has no project row.
+
+The route from here to `1.0.0` is in link:docs/plan/ULTRAPLAN.adoc[the plan].
 ====
 
 == The pipeline
@@ -73,7 +93,7 @@ QF_UFLIA / QF_BV   K-CUT + k=12 BMC    Idris2 ABI / Zig C1-C12 / MaxPlus
             v
    Z3 + CVC5 + Native Alethe Proof-DAG Kernel  ->  6-Kind Mutation (>= 95%)
             v
-   TrustLevel 4 Warrant/Receipt  ->  batch Coq + Lean  ->  Level 5 Receipt
+   TrustLevel 4 Warrant/Receipt  ->  batch Coq + Lean (planned)  ->  Level 5 Receipt
 ----
 
 == What exists in this repository
@@ -119,8 +139,8 @@ QF_UFLIA / QF_BV   K-CUT + k=12 BMC    Idris2 ABI / Zig C1-C12 / MaxPlus
 
 | link:examples/quintessence/README.adoc[Worked example]
 | `Verisim.Spec`, `Verisim.Entity`, `Verisim.Nif`, `verisim_nif.zig`, JCS NIF
-  receipt, Idris2 model, and TLA+ protocol model — verified end to end (12 QEDs,
-  25,910 Alethe steps, 100.00% mutation score).
+  receipt, Idris2 model, and TLA+ protocol model. See the status block above
+  for what the end-to-end run gives today.
 |===
 
 Architectural rationale is recorded in
@@ -133,7 +153,7 @@ link:docs/decisions/0004-three-layer-architecture.adoc[ADR-0004].
 just build                                                       # build libquintessence.so + CLI
 ./src/interface/ffi/zig-out/bin/quintessence doctor              # check Z3, CVC5, Zig, Alethe kernel
 ./src/interface/ffi/zig-out/bin/quintessence verify examples/quintessence
-just test                                                        # 10 Zig unit tests + 15 E2E cases
+just test                                                        # 10 Zig unit tests + 16 E2E cases
 just validate                                                    # RSR structure, deed, AI guide
 ----
 

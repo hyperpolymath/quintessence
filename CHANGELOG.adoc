@@ -10,6 +10,11 @@ https://semver.org/spec/v2.0.0.html[Semantic Versioning].
 
 ==== Fixed
 
+* Trust level (2026-11-15): a `coqc` and a `lean` binary on PATH raised the
+  reported trust level to 5, and no kernel check ran. The maximum is now 4,
+  and `--require-level-5` always reports `Q-504` in this version. Suite case
+  16 checks this. The README now states the measured state and the limits of
+  the evidence.
 * `repo-init` minting a repository created with GitHub's "Use this
   template" (measured on metadatastician/lintel, 2026-10-14):
 ** provenance recorded the CHILD's own HEAD as the template commit. The

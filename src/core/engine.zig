@@ -64,6 +64,19 @@ pub const RunSummary = struct {
     output_text: []const u8,
 };
 
+/// snip: constant 4; raise only together with a real batch kernel run (M2/M5).
+pub const max_local_trust_level: u8 = 4;
+
+/// Highest trust level that this build can award for a run with `diag_count`
+/// diagnostics. Level 5 needs a Coq and a Lean 4 kernel check of the emitted
+/// `.v` and `.lean` obligations. This version emits those files and does not
+/// check them, so a `coqc` or `lean` binary on PATH must not raise the level.
+pub fn localTrustLevel(diag_count: usize) u8 {
+    return if (diag_count > 0) 0 else max_local_trust_level;
+}
+
+// Checked end to end by case 16 of tests/quintessence/run_suite.sh.
+
 fn collectExFiles(alloc: std.mem.Allocator, io: std.Io, target: []const u8, out: *std.ArrayList([]const u8)) !void {
     if (std.mem.endsWith(u8, target, ".ex")) {
         try out.append(alloc, target);
@@ -215,14 +228,7 @@ pub fn runVerify(alloc: std.mem.Allocator, io: std.Io, opts: VerifyOptions) !Run
         );
     }
 
-    // Determine genuine trust level honestly (Doctrine #10: zero overclaim!)
-    const has_batch_kernels = tc.coq_version != null and tc.lean_version != null;
-    const trust_level: u8 = if (diags.items.len > 0)
-        0
-    else if (has_batch_kernels)
-        5
-    else
-        4;
+    const trust_level = localTrustLevel(diags.items.len);
 
     if (diags.items.len == 0 and opts.require_level_5 and trust_level < 5) {
         try diags.append(alloc, .{
@@ -230,7 +236,7 @@ pub fn runVerify(alloc: std.mem.Allocator, io: std.Io, opts: VerifyOptions) !Run
             .file = if (all_mods.items.len > 0) all_mods.items[0].file else ".",
             .line = 1,
             .col = 1,
-            .message = "Local Warrant/Receipt verified at TrustLevel 4 (`z3` + `cvc5` + `alethe-kernel` + `zig`); `--require-level-5` additionally requires `coqc` and `lean` on PATH for batch promotion",
+            .message = "Local Warrant/Receipt verified at TrustLevel 4 (`z3` + `cvc5` + `alethe-kernel` + `zig`); `--require-level-5` needs Coq and Lean 4 kernel checks of the emitted `.v` and `.lean` obligations, and this version does not run them",
         });
     }
 
@@ -292,7 +298,7 @@ pub fn runVerify(alloc: std.mem.Allocator, io: std.Io, opts: VerifyOptions) !Run
             .{
                 trust_level,
                 if (trust_level >= 5) "complete" else "verified_level_4",
-                if (has_batch_kernels) "[]" else "[\"coq\",\"lean4\"]",
+                "[\"coq\",\"lean4\"]",
             },
         ));
         try rraw.appendSlice(alloc, "{\"kernel\":\"z3\",\"status\":\"unsat\",\"version\":");

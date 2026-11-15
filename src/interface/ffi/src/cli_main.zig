@@ -81,7 +81,7 @@ pub fn main(init: std.process.Init) !u8 {
             var raw: std.ArrayList(u8) = .empty;
             try raw.appendSlice(alloc, "{\"schema\":\"quintessence.doctor/v1\",\"ready\":");
             try raw.appendSlice(alloc, if (ok) "true" else "false");
-            try raw.appendSlice(alloc, try std.fmt.allocPrint(alloc, ",\"max_local_trust_level\":{d},\"tools\":{{\"z3\":", .{if (tc.coq_version != null and tc.lean_version != null) @as(u8, 5) else @as(u8, 4)}));
+            try raw.appendSlice(alloc, try std.fmt.allocPrint(alloc, ",\"max_local_trust_level\":{d},\"tools\":{{\"z3\":", .{core.max_local_trust_level}));
             if (tc.z3_version) |v| try jcs.writeString(alloc, &raw, v) else try raw.appendSlice(alloc, "null");
             try raw.appendSlice(alloc, ",\"cvc5\":");
             if (tc.cvc5_version) |v| try jcs.writeString(alloc, &raw, v) else try raw.appendSlice(alloc, "null");
@@ -103,24 +103,25 @@ pub fn main(init: std.process.Init) !u8 {
                 \\  [REQUIRED] cvc5 (Alethe) : {s}
                 \\  [REQUIRED] zig           : {s}
                 \\  [REQUIRED] alethe-kernel : built-in 0.1.0
-                \\  [OPTIONAL] coqc (Level5) : {s}
-                \\  [OPTIONAL] lean (Level5) : {s}
+                \\  [UNUSED]   coqc          : {s}
+                \\  [UNUSED]   lean          : {s}
                 \\  [OPTIONAL] idris2        : {s}
                 \\  [OPTIONAL] apalache-mc   : {s}
                 \\------------------------------------------------------------
                 \\Status: {s} (maximum achievable local trust level: Level {d})
+                \\Level 5 needs kernel checks of the emitted `.v` and `.lean` files; this version does not run them.
                 \\
             ,
                 .{
                     tc.z3_version orelse "MISSING",
                     tc.cvc5_version orelse "MISSING",
                     tc.zig_version orelse "MISSING",
-                    tc.coq_version orelse "not installed (batch Level-5 check deferred; `.v` emitted)",
-                    tc.lean_version orelse "not installed (batch Level-5 check deferred; `.lean` emitted)",
+                    tc.coq_version orelse "not installed",
+                    tc.lean_version orelse "not installed",
                     tc.idris2_version orelse "not installed (`qir/v1` serialized natively)",
                     tc.apalache_version orelse "not installed (`k = 12` BMC discharged via Z3+CVC5; `.tla` emitted)",
                     if (ok) "READY" else "INCOMPLETE (missing required tool)",
-                    if (tc.coq_version != null and tc.lean_version != null) @as(u8, 5) else @as(u8, 4),
+                    core.max_local_trust_level,
                 },
             );
             try stdout.writeStreamingAll(io, msg);

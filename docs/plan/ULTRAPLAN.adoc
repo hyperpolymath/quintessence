@@ -1,0 +1,100 @@
+// SPDX-License-Identifier: CC-BY-SA-4.0
+// SPDX-FileCopyrightText: 2026 Jonathan D.A. Jewell <j.d.a.jewell@open.ac.uk>
+= Quintessence: plan to v1.0.0
+:revdate: 2026-11-15
+:toc:
+
+Quintessence is an alpha prototype of a three-layer verifier for Elixir/OTP.
+This plan is the execution layer. It does not replace the design documents.
+The work packages WP-01 to WP-27 stay in
+link:../status/QUINTESSENCE-ROADMAP.adoc[the roadmap]. The milestones M1 to M5
+stay in link:../architecture/QUINTESSENCE-IMPLEMENTATION-PLAN.adoc[the
+implementation plan]. Where those two documents disagree, this plan decides
+the order.
+
+The work that is shared with the sibling verifiers (`atoma`, `Apodeixis.jl`,
+`bactrian`, `canonry`, `chancel`) is in the family plan,
+`docs/plan/FAMILY-ULTRAPLAN.adoc` in `hyperpolymath/atoma`. IDs F1 to F12 and
+waves W0 to W5 come from that plan.
+
+== Measured state on 2026-11-15
+
+Tools: Zig 0.17.1, Z3 4.8.12, cvc5 1.1.2.
+
+* `cd src/interface/ffi && zig build test`: 10 of 10 unit tests passed.
+* `bash tests/quintessence/run_suite.sh`: 14 passed, 2 failed (cases 2 and 15).
+* The same 2 cases fail with Zig 0.17.0.
+* Not run: the Elixir front end (`mix`), Idris2, Apalache, Coq, Lean.
+
+== Open holes
+
+These are soundness holes or false claims. Doctrine rule 1 puts them before
+all feature work. `H0` is closed. The others are open.
+
+[cols="1,4,2",options="header"]
+|===
+| ID | Hole | Evidence
+| H0 (closed) | A `coqc` and a `lean` binary on PATH gave TrustLevel 5 with no kernel check. | Fixed. Suite case 16 fails on the old code.
+| H1 | The Alethe check is structural. It accepts a certificate with invalid rule applications. `:rule hole` is counted and not rejected. | `src/core/smt_alethe.zig`
+| H2 | The NIF receipt emitter records C1 to C12 as `proved`. The code checks one nullable-pointer rule and a list of banned patterns. | `src/core/layer_c.zig`
+| H3 | The committed NIF receipt hash does not match a fresh build on a second host, with Zig 0.17.0 or 0.17.1. The receipt also hard-codes tool versions. | Suite case 2
+| H4 | The `k = 12` bounded model check unrolls a generic model, not the GenServer under test. The Y-6 falsifier discards the Z3 result and prints a fixed trace. | `src/core/layer_b.zig`
+| H5 | The mutation engine uses Z3 only and carries the ECHIDNA name. It does not call ECHIDNA. The `BudgetInflate` result comes from a constant comparison, not from a pipeline run. | `src/core/vacuity_mutation.zig`
+| H6 | Layer A has special cases for the functions of the worked example. | `src/core/layer_a.zig`
+| H7 | `Qir.idr` is not in `abi.ipkg`. No tool type-checks it. | `src/interface/abi.ipkg`
+| H8 | Code and README need Zig 0.17. `mise.lock` pins 0.16.0. Z3 and cvc5 are not pinned. | `mise.toml`, `mise.lock`
+| H9 | No CI workflow builds or tests the engine. | `.github/workflows/`
+| H10 | `examples/quintessence/mix/tasks/verify.ex` calls modules that do not exist. `examples/quintessence/README.adoc` prints output that no tool produced. | read
+|===
+
+== Definition of v1.0.0
+
+The seven family gates apply. The text below is the Quintessence reading.
+
+[cols="1,4,3",options="header"]
+|===
+| Gate | Acceptance | Falsifier
+| Language boundary | Closed Elixir subset for each layer. The firewall works on expanded code, not on names. | An aliased or imported banned call passes.
+| Source connection | Obligations come from the function body and the handler code. No special case for an example. | A body-only mutant keeps the old evidence.
+| Semantics | Layer A contracts and termination. Layer B protocol rules for the real handler. Layer C obligations checked, not pattern-matched. | A NIF with an unchecked obligation gets `proved`.
+| Replay | Each certificate passes a real checker through ECHIDNA. Level 5 needs both kernels to check the emitted files. | A certificate with a `hole` step is accepted.
+| Practical coverage | Three pilots beyond the worked example. | A second project needs engine changes.
+| Assurance | Mutants are killed by the full pipeline. The suite runs in CI on pinned tools. | A mutant survives because the gate used a fast mode.
+| Release and estate | README, deed and changelog are true. The NIF receipt reproduces on a clean runner. | The receipt differs between two hosts.
+|===
+
+== Sequence
+
+[cols="1,4,1,1,3",options="header"]
+|===
+| Stage | Work | Lead | Size | Exit evidence
+| Q0 Truth (W0) | Close H2, H3, H8, H9, H10. Sync the template (F1) to get the lock tooling, then add `quintessence.yml` with the unit tests. Pin Zig, Z3 and cvc5 with digests. Make the receipt record what was checked. | Opus for H2 and H3; Sonnet for H8 to H10 | M | The suite passes on a clean runner. The receipt reproduces. No `proved` entry without a check.
+| Q1 Evidence spine (W1) | Replace the private JCS code, SMT driver and mutation name with the family kit (F3) and the ECHIDNA client (F7). Close H1 and H5 by use of the ECHIDNA certificate path. Maps to WP-03, WP-08, WP-11, WP-12. | Opus | L | One obligation replays through `echidna prove`. A certificate with a `hole` step fails.
+| Q2 Layer A, source-bound (W2) | Remove H6. One pure function, body-derived obligations, body-only mutant rejected. Type-check `Qir.idr` (H7). Maps to WP-02, WP-05 to WP-07, WP-13, and M1. | Opus | L | The W2 family exit evidence, with the reuse measures.
+| Q3 Layer C through `atoma` (W3, F8) | Send the Zig NIF to `atoma` for C1 to C12. Keep only the Rustler rules here. Maps to WP-14, WP-15, WP-17, and M4. | Opus | L | A NIF with an alias defect is rejected by a checked result.
+| Q4 Layer B, real protocol (W3, F9) | Model the handler under test. Run Apalache. Close H4. Share the protocol layer with `bactrian`. Maps to WP-18 to WP-22, and M3. | Opus, advisor review | XL (split first) | A handler that breaks the protocol is rejected with a real trace.
+| Q5 Kernel chain (W4) | Batch Coq and Lean checks of the emitted obligations. Signed receipts. Level 5 becomes possible. Maps to WP-09, WP-26, WP-27, M2 and M5. | Opus | L | `--require-level-5` passes only when both kernels checked the files.
+| Q6 Theory and release (W4, W5) | Composition theorem and reply chain (WP-24, WP-25) in Agda, then the Rocq and Lean legs (F11). Three pilots. Release audit (F12). | Opus, advisor review | XL (split first) | All seven gates pass on the release commit.
+|===
+
+Sonnet does the implementation tasks inside each stage from an Opus brief.
+Haiku runs the scout pass before each step and does the mechanical edits.
+The advisor reviews the close of each stage and each change to a status word.
+
+== What Quintessence takes from the family, and gives
+
+* Takes: the evidence kit (F3), the pin table (F6), the ECHIDNA client (F7),
+  Zig checks from `atoma` (F8).
+* Gives: the error-code and exit-code contract (`src/core/errors.zig`), the
+  suite harness (`assert_case`), the SARIF output. These are candidates for
+  the kit.
+* Shares with `bactrian`: the actor protocol layer (F9).
+
+== Stop points
+
+* If Q0 cannot make the receipt reproduce, remove the claim of a reproducible
+  receipt from the README and the design, then continue.
+* If Q1 shows that ECHIDNA cannot check the certificates, stop and review the
+  evidence design with the advisor. Do not improve the local Alethe check as a
+  substitute.
+* Do not start Q4 or Q6 before they are split into parts of size L or smaller.
