@@ -4,7 +4,7 @@
 #
 # End-to-End Formal Verification & Falsifier Regression Suite for `quintessence`.
 #
-# Executes the compiled native `quintessence` binary across 14 live positive,
+# Executes the compiled native `quintessence` binary across 16 live positive,
 # firewall, K-CUT falsifier, TINI information-flow, MaxPlus slice-budget, binary
 # tamper, vacuity, and ECHIDNA mutation test cases, asserting BOTH the exact
 # error code (`Q-xxx`) AND the exact OS exit status (`0..5`).
@@ -48,7 +48,7 @@ assert_case() {
     fi
 }
 
-echo "=== Quintessence 15-Case Live Formal Verification Suite ==="
+echo "=== Quintessence 16-Case Live Formal Verification Suite ==="
 
 # 1. Toolchain doctor check
 assert_case "01. Toolchain doctor ready" 0 "Status: READY" \
@@ -216,6 +216,15 @@ assert_case "14. ECHIDNA mutation engine catches weak @post (Q-603, exit 5)" 5 "
 # 15. Honest Trust-Level 5 batch kernel check when coqc/lean absent -> Q-504, exit 4
 assert_case "15. Honest Level-5 batch kernel gate without Coq/Lean (Q-504, exit 4)" 4 "[Q-504]" \
     verify examples/quintessence --no-mutation --require-level-5 --out-dir "$WORK/o15"
+
+# 16. Falsifier: `coqc` and `lean` on PATH must not raise the trust level.
+#     No kernel check of the emitted `.v` and `.lean` files exists yet.
+mkdir -p "$WORK/fakebin"
+printf '#!/bin/sh\necho "The Coq Proof Assistant, version 9.9.9"\n' > "$WORK/fakebin/coqc"
+printf '#!/bin/sh\necho "Lean (version 9.9.9)"\n' > "$WORK/fakebin/lean"
+chmod +x "$WORK/fakebin/coqc" "$WORK/fakebin/lean"
+PATH="$WORK/fakebin:$PATH" assert_case "16. Tools on PATH do not grant Level 5 (doctor reports Level 4)" 0 "maximum achievable local trust level: Level 4" \
+    doctor
 
 echo "------------------------------------------------------------"
 echo "Suite summary: $PASS passed, $FAIL failed"

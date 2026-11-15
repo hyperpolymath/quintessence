@@ -262,7 +262,7 @@ pub const CATALOGUE = [_]ErrorSpec{
         .exit_code = .incomplete_evidence,
         .rule = "Trust-Level Gate",
         .falsifier = "Verification reached local Warrant/Receipt TrustLevel 4, whereas `--require-level-5` requires external batch Coq + Lean 4 kernel QEDs.",
-        .remedy = "Run ECHIDNA batch verification with `coqc` and `lean` installed to promote the Warrant + emitted `.v`/`.lean` obligations to Level 5.",
+        .remedy = "Level 5 is not available in this version. The emitted `.v` and `.lean` obligations must pass a Coq and a Lean 4 kernel check first (planned, milestones M2 and M5).",
     },
 
     // Q-6xx: Vacuity probes (V1-V4), mutation score, and bounded counterexamples
