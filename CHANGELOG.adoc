@@ -12,7 +12,9 @@ https://semver.org/spec/v2.0.0.html[Semantic Versioning].
 
 * Toolchain (2026-11-19, hole H8): `mise.toml` pins Zig to 0.17.1, and
   `mise.lock` was regenerated with `mise lock` (it pinned 0.16.0). Z3 4.8.12
-  and cvc5 1.1.2 are measured to work but are still not pinned.
+  and cvc5 1.1.2 are measured to work. Z3 and cvc5 are now listed in
+  `build/manifest.scm` and `build/guix.scm`, pinned by the Guix commit in
+  `build/channels.scm` (Z3 4.13.0, cvc5 1.3.4 there; not yet run against the suite).
 
 * Trust level (2026-11-15): a `coqc` and a `lean` binary on PATH raised the
   reported trust level to 5, and no kernel check ran. The maximum is now 4,
