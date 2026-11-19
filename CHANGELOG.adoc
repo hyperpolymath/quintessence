@@ -10,6 +10,10 @@ https://semver.org/spec/v2.0.0.html[Semantic Versioning].
 
 ==== Fixed
 
+* Example truthfulness (H10, 2026-11-19): `examples/quintessence/README.adoc` no
+  longer prints output that no tool produced; it shows real CLI output.
+  `examples/quintessence/mix/tasks/verify.ex` is marked as a design sketch
+  that does not run (it calls modules that do not exist; plan stage Q2).
 * Trust level (2026-11-15): a `coqc` and a `lean` binary on PATH raised the
   reported trust level to 5, and no kernel check ran. The maximum is now 4,
   and `--require-level-5` always reports `Q-504` in this version. Suite case

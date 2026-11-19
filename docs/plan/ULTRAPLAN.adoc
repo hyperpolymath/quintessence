@@ -44,7 +44,7 @@ all feature work. `H0` is closed. The others are open.
 | H7 | `Qir.idr` is not in `abi.ipkg`. No tool type-checks it. | `src/interface/abi.ipkg`
 | H8 | Code and README need Zig 0.17. `mise.lock` pins 0.16.0. Z3 and cvc5 are not pinned. | `mise.toml`, `mise.lock`
 | H9 | No CI workflow builds or tests the engine. | `.github/workflows/`
-| H10 | `examples/quintessence/mix/tasks/verify.ex` calls modules that do not exist. `examples/quintessence/README.adoc` prints output that no tool produced. | read
+| H10 (partly closed) | `examples/quintessence/mix/tasks/verify.ex` calls modules that do not exist. `examples/quintessence/README.adoc` printed output that no tool produced. | Closed 2026-11-19: the README now shows only output of the built CLI (passing module, K-CUT falsifier, vacuity), with versions and the known failures of the full example stated, and `verify.ex` is marked at its top and in the README as a design sketch that does not run. Still open: `verify.ex` is not real code (it waits for Q2), and the full example run exits 4 on a fresh build (H3).
 |===
 
 == Definition of v1.0.0
