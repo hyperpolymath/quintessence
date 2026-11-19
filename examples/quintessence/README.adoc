@@ -139,8 +139,15 @@ receipt carries the proof hash.
 
 == A passing run
 
-Real output, from the repository root, with the CLI built by
-`cd src/interface/ffi && zig build`:
+Real output, from the repository root. Build the CLI and put it on `PATH` first
+(the build writes `src/interface/ffi/zig-out/bin/quintessence` and does not
+install it):
+
+[source,sh]
+----
+(cd src/interface/ffi && zig build)
+export PATH="$PWD/src/interface/ffi/zig-out/bin:$PATH"
+----
 
 [source,text]
 ----
@@ -175,7 +182,32 @@ shown as a pass here.
 
 A client that claims knowledge across a `cast` is rejected. The fixture below is
 the one the test suite uses (`tests/quintessence/run_suite.sh`, case 9); it is a
-minimal module, not a copy of `Verisim.Entity`. Real output:
+minimal module, not a copy of `Verisim.Entity`. Write it to a scratch directory,
+then run the CLI on it (with the CLI on `PATH` as above):
+
+[source,sh]
+----
+cat > bad_kcut_cast.ex <<'EX'
+defmodule BadKCutCast do
+  use GenServer
+  use Quintessence.Face, layer: :b
+
+  @choreography [
+    roles: [:client, :entity],
+    messages: [
+      {:client, :entity, :commit, [:payload]}
+    ],
+    knowledge: [
+      {:client, :entity, :committed, [:version], {:cast, :commit}}
+    ]
+  ]
+
+  def handle_cast({:commit, _payload}, state), do: {:noreply, state}
+end
+EX
+----
+
+Real output:
 
 [source,text]
 ----
@@ -219,8 +251,22 @@ K-CUT proof and is not accepted by `--strict`.
 
 A postcondition that every input satisfies leaves mutants alive. The fixture is
 the one in `tests/quintessence/run_suite.sh` case 14 (a minimal module with
-`@pre spec(x >= 10)` and `@post spec(result >= 0)`; not `Verisim.Spec`). Real
-output:
+`@pre spec(x >= 10)` and `@post spec(result >= 0)`; not `Verisim.Spec`). Write it
+to a scratch directory, then run the CLI on it:
+
+[source,sh]
+----
+cat > weak_spec.ex <<'EX'
+defmodule WeakSpec do
+  use Quintessence.Face, layer: :a
+  @pre spec(x >= 10)
+  @post spec(result >= 0)
+  def increment(x), do: x + 1
+end
+EX
+----
+
+Real output:
 
 [source,text]
 ----
