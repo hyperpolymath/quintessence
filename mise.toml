@@ -19,4 +19,4 @@ lockfile = true
 just = "latest"
 shellcheck = "latest"
 trivy = "latest"          # just deps-audit
-zig = "latest"
+zig = "0.17.1"           # code and README need 0.17 (hole H8)

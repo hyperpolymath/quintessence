@@ -10,6 +10,10 @@ https://semver.org/spec/v2.0.0.html[Semantic Versioning].
 
 ==== Fixed
 
+* Toolchain (2026-11-19, hole H8): `mise.toml` pins Zig to 0.17.1, and
+  `mise.lock` was regenerated with `mise lock` (it pinned 0.16.0). Z3 4.8.12
+  and cvc5 1.1.2 are measured to work but are still not pinned.
+
 * Trust level (2026-11-15): a `coqc` and a `lean` binary on PATH raised the
   reported trust level to 5, and no kernel check ran. The maximum is now 4,
   and `--require-level-5` always reports `Q-504` in this version. Suite case
