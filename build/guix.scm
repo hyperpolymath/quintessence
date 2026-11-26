@@ -37,7 +37,8 @@
   (build-system copy-build-system)
   (arguments (list #:install-plan #~'(("." "share/quintessence/"))))
   (native-inputs (map spec->input (list "git" "bash" "coreutils" "nss-certs" "just" "mise"
-                                        "shellcheck" "chez-scheme" "gmp" "gcc-toolchain" "zig")))
+                                        "shellcheck" "chez-scheme" "gmp" "gcc-toolchain" "zig"
+                                        "z3" "cvc5")))
   (home-page "https://github.com/hyperpolymath/quintessence")
   (synopsis "Rhodium Standard Repository template")
   (description "The estate's repository template: the RSR layout, an Idris2 ABI

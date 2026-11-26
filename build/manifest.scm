@@ -12,4 +12,8 @@
 ;; Canon: hyperpolymath/standards 3-practice/provisioning/PROVISIONING-STANDARD.adoc
 (specifications->manifest
  (list "git" "bash" "coreutils" "nss-certs" "just" "mise"
-       "shellcheck" "chez-scheme" "gmp" "gcc-toolchain" "zig"))
+       "shellcheck" "chez-scheme" "gmp" "gcc-toolchain" "zig"
+       ;; SMT solvers (hole H8). Pinned by the Guix commit in channels.scm, which
+       ;; resolves to z3 4.13.0 and cvc5 1.3.4. Suite run with these versions (upstream binaries): 14 pass, 2 fail (H3).
+       ;; Z3 4.8.12 and cvc5 1.1.2 also gave 14 pass, 2 fail.
+       "z3" "cvc5"))
