@@ -1,7 +1,13 @@
 # SPDX-License-Identifier: MPL-2.0
 # Copyright (c) 2026 Jonathan D.A. Jewell <j.d.a.jewell@open.ac.uk>
 #
-# Reference sketch. Not compiled by this checkout. See README.adoc.
+# DESIGN SKETCH. THIS FILE DOES NOT RUN.
+# It calls Quintessence.Project, .Frontend, .Echidna, .Batch, .Mutation, .Gate
+# and .Report, and none of them exists in this repository (nor does
+# Quintessence.Doctor; only Quintessence.Error is defined, in lib/). It is not
+# compiled by this checkout. Plan stage Q2 (docs/plan/ULTRAPLAN.adoc) is the
+# stage that would make it real. Today the working entry point is the
+# `quintessence` CLI (src/interface/ffi). See README.adoc.
 
 defmodule Mix.Tasks.Verify do
   @moduledoc """
